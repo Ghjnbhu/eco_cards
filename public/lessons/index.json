@@ -1,0 +1,11 @@
+{
+  "lessons": [
+    { "file": "Table_ei.json",     "title": "Table_ei (5)" },
+    { "file": "Table_æ.json",     "title": "Table_æ (9)" },
+    { "file": "Alphabet_Vowels.json",     "title": "Alphabet Vowels" },
+    { "file": "Alphabet.json",     "title": "Alphabet (26)" },
+    { "file": "KitchenCards_20.json",     "title": "Kitchen Cards (20)" },
+    { "file": "MyEnglishFlashcards.json", "title": "My English Flashcards (20)" },
+    { "file": "MyEnglishLessons.json",    "title": "My English Lessons (15)" }
+  ]
+}

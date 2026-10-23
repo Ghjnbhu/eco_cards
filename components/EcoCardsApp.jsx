@@ -1,0 +1,3802 @@
+'use client';
+// All prior behavior preserved.
+//
+// STAND-BY ATTENTION ANIMATION:
+//  The header title button gets one of FIVE attention variants
+//  (glow / breathe / shimmer / heartbeat / rotate), rolled at random on
+//  load and re-rolled after every study session ("break"). Gated by
+//  `isStandby`.
+//
+// FIX: voice loading no longer leaves `isSpeaking = true` stuck.
+//      `applyDatabasePayload` and `prevRecord` / `nextRecord` reset
+//      `isSpeaking`, `isListeningForRepeat`, `manualPulseCard` so
+//      `isStandby` becomes true after a lesson loads.
+//
+// REMOVED: the "dot badge" attention variant (`.title-attention-dot`)
+//          has been removed from ATTENTION_VARIANTS and the header
+//          title button no longer renders the extra dot <span>.
+//
+// NEW (credit modal): the credit modal now shows:
+//   • a centered "Click to share Eco Cards link." button
+//   • a centered "Use browser Chrome or Opera." hint
+//   • a clickable QR code image (src/assets/qr.svg) on a white card
+//     that triggers the SAME Share action as the hint above
+//   • a centered "Suggestions for improvement: <email>" line
+// The modal no longer renders a footer / "Ok" button. It is closed
+// by clicking the dark overlay or the × icon in its header.
+//
+// SHARE STRATEGY (shareEcoCards):
+//   • Mobile (Android / iOS): use navigator.share() so the native
+//     app picker appears (WhatsApp, Telegram, Mail, …).
+//   • Desktop (Windows / macOS / Linux): skip navigator.share()
+//     entirely and copy the URL to the clipboard. This sidesteps the
+//     unreliable Windows 10 share sheet, where Teams/Outlook often
+//     received the message body without a usable link.
+//   • Anywhere: if the share path is missing or fails for any reason
+//     other than user cancellation, fall back to clipboard copy with
+//     a confirmation alert.
+//
+// FIX (platform-consistent status pill icon):
+//   On some Android browsers the pill briefly showed 🎤 during a normal
+//   auto-pronounce study (repeat-after-me OFF). Four defenses:
+//     1. The 🎤 render is gated by `settings.repeatAfterMe && isStudying
+//        && isListeningForRepeat && !showRepeatChip` — the mic can only
+//        appear during a real listening cycle of a real study session.
+//     2. `startStudyTimer` force-clears `isListeningForRepeat` and
+//        `isSpeaking` at the top, so a stale `true` cannot survive from
+//        a previous session.
+//     3. `speakOneAndListen` bails out if `settings.repeatAfterMe` is
+//        false, so the mic cannot physically start when repeat mode is
+//        off, even if a stale ref says otherwise.
+//     4. `loadSettingsFromFile` ignores `repeatAfterMe` and
+//        `repeatOnWordsNotEqual` so an old `.settings` file cannot
+//        silently re-enable repeat mode on the device.
+//   The "speaking" indicator in the pill uses 🎧 (U+1F3A7) instead of
+//   🔊 because Android's Noto Color Emoji renders the whole speaker
+//   family (🔈 🔉 🔊) in a mic-like silhouette at pill size. 🎧 draws
+//   unambiguously on every platform.
+
+import React, { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react';
+import SpeechRecognitionLib, { useSpeechRecognition } from 'react-speech-recognition';
+import { recordAttempt, flushAutoBuffer, fetchStats } from '../lib/raf-stats';
+import '../src/App.css';
+
+const LESSONS_INDEX_URL = '/lessons/index.json';
+// ----- comment
+const AUTO_H_PADDING  = 24;
+const MIN_CARD_WIDTH  = 180;
+const MIN_CARD_HEIGHT = 180;
+const MAX_AUTO_CARD_WIDTH = 1000;
+
+const TOP_BAR_GAP_PX = 5;
+
+const TOP_BAR_HEIGHT_LANDSCAPE = 52;
+const TOP_BAR_HEIGHT_PORTRAIT  = 96;
+
+const TRANSCRIPT_CHUNK_WORDS = 6;
+
+const LISTEN_MIN_MS = 2500;
+
+const SILENCE_DEBOUNCE_MS = 1500;
+
+const MAX_LETTER_REPEATS = 12;
+const MAX_WORD_REPEATS  = 6;
+
+const ENGLISH_LANG_PREFIXES = ['en-gb', 'en-us', 'en-au'];
+const RUSSIAN_LANG_PREFIXES = ['ru-ru'];
+
+const DB_FILENAME_COOKIE = 'ecoCards.dbFileName';
+const DB_FILENAME_COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
+
+// ▼ Standby attention animation variants for the header title
+const ATTENTION_VARIANTS = ['glow', 'breathe', 'shimmer', 'heartbeat', 'rotate'];
+
+// ▼ Keys that must never be restored from a saved .settings file.
+//   They are session-critical flags whose "on" state changes which
+//   icon the status pill shows. Restoring them silently could leave
+//   the app in repeat mode against the user's current intent.
+const SESSION_ONLY_KEYS = ['repeatAfterMe', 'repeatOnWordsNotEqual'];
+
+const setCookie = (name, value, maxAgeSeconds) => {
+  if (typeof document === 'undefined') return;
+  const encoded = encodeURIComponent(value ?? '');
+  const parts = [`${name}=${encoded}`, 'path=/', 'SameSite=Lax'];
+  if (typeof maxAgeSeconds === 'number') parts.push(`max-age=${maxAgeSeconds}`);
+  document.cookie = parts.join('; ');
+};
+const getCookie = (name) => {
+  if (typeof document === 'undefined') return '';
+  const prefix = name + '=';
+  const found = document.cookie.split('; ').find((row) => row.startsWith(prefix));
+  if (!found) return '';
+  try { return decodeURIComponent(found.slice(prefix.length)); } catch (_) { return ''; }
+};
+
+const deleteCookie = (name) => {
+  if (typeof document === 'undefined') return;
+  document.cookie = `${name}=; path=/; SameSite=Lax; max-age=0`;
+};
+
+const normalizeForComparison = (str) => {
+  if (!str) return '';
+  return String(str)
+    .toLowerCase()
+    .replace(/[.,!?;:՝։…«»"'()\[\]{}]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+};
+
+const levenshtein = (a, b) => {
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  const matrix = Array.from({ length: a.length + 1 }, () => new Array(b.length + 1).fill(0));
+  for (let i = 0; i <= a.length; i++) matrix[i][0] = i;
+  for (let j = 0; j <= b.length; j++) matrix[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      matrix[i][j] = Math.min(
+        matrix[i - 1][j] + 1,
+        matrix[i][j - 1] + 1,
+        matrix[i - 1][j - 1] + cost
+      );
+    }
+  }
+  return matrix[a.length][b.length];
+};
+
+const similarityRatio = (a, b) => {
+  const na = normalizeForComparison(a);
+  const nb = normalizeForComparison(b);
+  if (!na && !nb) return 1;
+  if (!na || !nb) return 0;
+  const dist = levenshtein(na, nb);
+  const maxLen = Math.max(na.length, nb.length);
+  return 1 - dist / maxLen;
+};
+
+const normalizeVoiceName = (name) =>
+  (name || '')
+    .toLowerCase()
+    .replace(/[\u00A0\u2000-\u200B]/g, ' ')
+    .replace(/[–—−]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const stripTrailingPunctuation = (text) => {
+  if (!text) return '';
+  return String(text).replace(/[.,!?;:]+$/g, '').trim();
+};
+
+const lastWords = (text, n) => {
+  if (!text) return '';
+  const words = String(text).trim().split(/\s+/).filter(Boolean);
+  if (words.length <= n) return words.join(' ');
+  return words.slice(-n).join(' ');
+};
+
+const isLatinChar = (ch) => /[A-Za-z\u00C0-\u024F]/.test(ch);
+
+const splitTranslationByScript = (text) => {
+  if (!text) return [];
+  const segments = [];
+  let current = '';
+  let currentIsLatin = null;
+
+  const flush = () => {
+    if (current.length === 0) return;
+    segments.push({ text: current, isLatin: !!currentIsLatin });
+    current = '';
+    currentIsLatin = null;
+  };
+
+  for (const ch of String(text)) {
+    if (isLatinChar(ch)) {
+      if (currentIsLatin === false) flush();
+      currentIsLatin = true;
+      current += ch;
+    } else if (/\s/.test(ch) || /[.,!?;:'"()\[\]{}\-–—…«»0-9]/.test(ch)) {
+      if (currentIsLatin === null) currentIsLatin = false;
+      current += ch;
+    } else {
+      if (currentIsLatin === true) flush();
+      currentIsLatin = false;
+      current += ch;
+    }
+  }
+  flush();
+
+  return segments.filter((s) => s.text.trim() !== '');
+};
+
+const LETTER_ALIASES = {
+  a: ['a', 'eh', 'hey', 'ay'],
+  b: ['b', 'be', 'bee'],
+  c: ['c', 'see', 'sea'],
+  d: ['d', 'dee'],
+  e: ['e', 'ee'],
+  f: ['f', 'eff'],
+  g: ['g', 'gee', 'jee'],
+  h: ['h', 'aitch', 'haitch'],
+  i: ['i', 'eye', 'ay', 'hi'],
+  j: ['j', 'jay'],
+  k: ['k', 'kay'],
+  l: ['l', 'el', 'ell'],
+  m: ['m', 'em'],
+  n: ['n', 'en'],
+  o: ['o', 'oh', 'owe'],
+  p: ['p', 'pee', 'pea'],
+  q: ['q', 'cue', 'queue'],
+  r: ['r', 'are', 'ar'],
+  s: ['s', 'ess'],
+  t: ['t', 'tee', 'tea'],
+  u: ['u', 'you', 'ewe'],
+  v: ['v', 'vee'],
+  w: ['w', 'double you', 'double-u', 'doubleyou'],
+  x: ['x', 'ex'],
+  y: ['y', 'why', 'wye'],
+  z: ['z', 'zee', 'zed'],
+};
+
+const isLetterMatch = (expected, chunk) => {
+  const ne = normalizeForComparison(expected);
+  const nc = normalizeForComparison(chunk);
+  if (!ne || !nc) return false;
+  if (ne.length !== 1 || !/[a-z]/.test(ne)) return false;
+  const aliases = LETTER_ALIASES[ne];
+  if (!aliases) return false;
+  return aliases.includes(nc);
+};
+
+const chunkTokens = (nc) => nc.split(/\s+/).filter(Boolean);
+
+const allTokensEqual = (tokens, base) =>
+  tokens.length > 0 && tokens.every((t) => t === base);
+
+const isElongationOf = (nc, base) => {
+  if (!base) return false;
+  if (!/^(.)\1*$/.test(nc)) return false;
+  if (nc.length > MAX_LETTER_REPEATS) return false;
+  if (base.length !== 1) return false;
+  return nc[0] === base;
+};
+
+const isRepetitionOf = (nc, base) => {
+  if (!base) return false;
+  const tokens = chunkTokens(nc);
+  if (tokens.length < 2) return false;
+  if (tokens.length > MAX_LETTER_REPEATS) return false;
+  return allTokensEqual(tokens, base);
+};
+
+const isRepeatedLetterMatch = (expected, chunk) => {
+  const ne = normalizeForComparison(expected);
+  const nc = normalizeForComparison(chunk);
+  if (!ne || !nc) return false;
+  if (ne.length !== 1 || !/[a-z]/.test(ne)) return false;
+  const candidates = [ne, ...(LETTER_ALIASES[ne] || [])];
+  for (const base of candidates) {
+    if (isElongationOf(nc, base)) return true;
+    if (isRepetitionOf(nc, base)) return true;
+  }
+  return false;
+};
+
+const isRepeatedWordMatch = (expected, chunk) => {
+  const ne = normalizeForComparison(expected);
+  const nc = normalizeForComparison(chunk);
+  if (!ne || !nc) return false;
+  if (ne.length < 2) return false;
+  const tokens = nc.split(/[\s,]+/).filter(Boolean);
+  if (tokens.length < 2) return false;
+  if (tokens.length > MAX_WORD_REPEATS) return false;
+  return tokens.every((t) => t === ne);
+};
+
+const readDisplayInfo = () => {
+  if (typeof window === 'undefined') return null;
+
+  const s = window.screen;
+  const dpr = window.devicePixelRatio || 1;
+  const so = s && s.orientation ? s.orientation : null;
+
+  return {
+    viewportCssWidth: window.innerWidth,
+    viewportCssHeight: window.innerHeight,
+    viewportClientWidth: document.documentElement.clientWidth,
+    viewportClientHeight: document.documentElement.clientHeight,
+    screenCssWidth: s ? s.width : null,
+    screenCssHeight: s ? s.height : null,
+    screenDeviceWidth: s ? Math.round(s.width * dpr) : null,
+    screenDeviceHeight: s ? Math.round(s.height * dpr) : null,
+    devicePixelRatio: dpr,
+    screenOrientationType: so ? so.type : null,
+    screenOrientationAngle: so && typeof so.angle === 'number' ? so.angle : null,
+  };
+};
+
+const useDisplayInfo = () => {
+  const [info, setInfo] = useState(null);
+
+  useEffect(() => {
+    const update = () => setInfo(readDisplayInfo());
+
+    update();
+
+    const onOrientation = () => {
+      update();
+      setTimeout(update, 150);
+      setTimeout(update, 400);
+    };
+
+    window.addEventListener('resize', update);
+    window.addEventListener('orientationchange', onOrientation);
+
+    const so = window.screen && window.screen.orientation;
+    if (so && so.addEventListener) so.addEventListener('change', onOrientation);
+
+    return () => {
+      window.removeEventListener('resize', update);
+      window.removeEventListener('orientationchange', onOrientation);
+      if (so && so.removeEventListener) so.removeEventListener('change', onOrientation);
+    };
+  }, []);
+
+  return info;
+};
+
+const matchesLangPrefix = (lang, prefixes) => {
+  const l = (lang || '').toLowerCase().replace('_', '-');
+  return prefixes.some((p) => l === p || l.startsWith(p + '-'));
+};
+
+const filterVoicesByLangPrefixes = (voices, prefixes) =>
+  voices.filter((v) => matchesLangPrefix(v.lang, prefixes));
+
+const pickRandom = (arr) => {
+  if (!arr || arr.length === 0) return null;
+  return arr[Math.floor(Math.random() * arr.length)];
+};
+
+const buildVoicesLoadedMessage = (voices) => {
+  const englishVoices = filterVoicesByLangPrefixes(voices, ENGLISH_LANG_PREFIXES);
+  const russianVoices = filterVoicesByLangPrefixes(voices, RUSSIAN_LANG_PREFIXES);
+
+  const formatVoice = (v) => `  • ${v.name} (${v.lang})`;
+
+  const lines = [`✅ ${voices.length} voice(s) loaded successfully!`];
+
+  lines.push('');
+  lines.push(`🇷🇺 Russian (ru-RU): ${russianVoices.length}`);
+  if (russianVoices.length > 0) {
+    russianVoices.forEach((v) => lines.push(formatVoice(v)));
+  } else {
+    lines.push('  (none)');
+  }
+
+  lines.push('');
+  lines.push(`🇬🇧 English (en-GB / en-US / en-AU): ${englishVoices.length}`);
+  if (englishVoices.length > 0) {
+    englishVoices.forEach((v) => lines.push(formatVoice(v)));
+  } else {
+    lines.push('  (none)');
+  }
+
+  return lines.join('\n');
+};
+
+const ColoredText = ({ text, colors }) => {
+  if (!text) return null;
+  if (!colors || Object.keys(colors).length === 0) return <>{text}</>;
+
+  const nodes = [];
+  let buffer = '';
+  let bufferColor = colors[0] || null;
+
+  for (let i = 0; i < text.length; i++) {
+    const color = colors[i] || null;
+    if (color === bufferColor) {
+      buffer += text[i];
+    } else {
+      if (buffer) {
+        nodes.push(
+          bufferColor
+            ? <span key={`c-${i}`} className={`fc-${bufferColor}`}>{buffer}</span>
+            : <span key={`p-${i}`}>{buffer}</span>
+        );
+      }
+      buffer = text[i];
+      bufferColor = color;
+    }
+  }
+  if (buffer) {
+    nodes.push(
+      bufferColor
+        ? <span key="last-c" className={`fc-${bufferColor}`}>{buffer}</span>
+        : <span key="last-p">{buffer}</span>
+    );
+  }
+  return <>{nodes}</>;
+};
+
+const normalizeFontColors = (card) => {
+  if (!card) return { word: {}, transcription: {}, translation: {} };
+  const lc = card.letterColors || {};
+  const hl = card.highlights || {};
+  const fc = card.fontColors || {};
+  return {
+    word:          fc.word          || lc.word          || hl.word          || {},
+    transcription: fc.transcription || lc.transcription || hl.transcription || {},
+    translation:   fc.translation   || lc.translation   || hl.translation   || {},
+  };
+};
+
+const App = () => {
+  const [dbLoaded, setDbLoaded] = useState(false);
+  const [dbFileName, setDbFileName] = useState(() => {
+    try { return getCookie(DB_FILENAME_COOKIE) || ''; } catch (_) { return ''; }
+  });
+  const [currentRecord, setCurrentRecord] = useState(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [allRecords, setAllRecords] = useState([]);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isLessonPickerOpen, setIsLessonPickerOpen] = useState(false);
+  const [timeRemaining, setTimeRemaining] = useState(0);
+  const [isStudying, setIsStudying] = useState(false);
+  const [activeCard, setActiveCard] = useState('singular');
+  const [availableVoices, setAvailableVoices] = useState([]);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [voiceSupport, setVoiceSupport] = useState(true);
+  const [voicesLoaded, setVoicesLoaded] = useState(false);
+  const [isLoadingVoices, setIsLoadingVoices] = useState(false);
+
+  const [isListeningForRepeat, setIsListeningForRepeat] = useState(false);
+  const [repeatStatus, setRepeatStatus] = useState('');
+  const [repeatProgress, setRepeatProgress] = useState({ current: 0, total: 0 });
+  const [lastRecognized, setLastRecognized] = useState('');
+
+  const [lessonsList, setLessonsList] = useState([]);
+  const [lessonsListError, setLessonsListError] = useState('');
+  const [isLoadingLessonsList, setIsLoadingLessonsList] = useState(false);
+
+  const [measuredTopBarHeight, setMeasuredTopBarHeight] = useState(null);
+
+  const [navRepeatActive, setNavRepeatActive] = useState(false);
+
+  const [initialLoadResolved, setInitialLoadResolved] = useState(false);
+
+  const [isStatsOpen, setIsStatsOpen] = useState(false);
+  const [statsData, setStatsData] = useState(null);
+  const [statsError, setStatsError] = useState('');
+  const [isLoadingStats, setIsLoadingStats] = useState(false);
+
+  const [isCreditOpen, setIsCreditOpen] = useState(false);
+
+  // ── Standby attention animation for the header title ──
+  const [attentionVariant, setAttentionVariant] = useState('glow');
+
+  const attentionVariantRef = useRef(attentionVariant);
+  const listeningRef = useRef(false);
+  const sawListeningRef = useRef(false);
+
+  const displayInfo = useDisplayInfo();
+
+  const [settings, setSettings] = useState({
+    autoAlign: true,
+    topPanelWidth: 916,
+    cardWidth: 400,
+    cardHeight: 400,
+    cardGap: 10,
+    showTranscription: true,
+    showTranslation: true,
+    loadLessonLocally: false,
+    selectedLessonFile: '',
+    fontSize: 32,
+    showSvgBorder: false,
+    theme: 'dark',
+    studyTime: 10,
+    selectedVoiceName: "",
+    repeatTimes: 3,
+    autoPronounce: true,
+    pronounceTranslation: true,
+    translationVoiceName: "",
+    translationRepeatTimes: 1,
+    randomOrder: false,
+    repeatAfterMe: false,
+    repeatOnWordsNotEqual: false,
+    hideAlerts: true,
+    invisibleTopBar: true,
+    hideOptionsBelow: true,
+  });
+
+  const singularSvgRef = useRef(null);
+  const pluralSvgRef = useRef(null);
+  const timerIntervalRef = useRef(null);
+  const currentIndexRef = useRef(0);
+  const activeCardRef = useRef('singular');
+  const allRecordsRef = useRef([]);
+  const isStudyingRef = useRef(false);
+  const settingsRef = useRef(settings);
+  const singularCardRef = useRef(null);
+  const pluralCardRef = useRef(null);
+  const completionAlertShownRef = useRef(false);
+  const isCompletingRef = useRef(false);
+  const userSelectedVoiceNameRef = useRef("");
+  const synthRef = useRef(null);
+  const voiceLoadTimeoutRef = useRef(null);
+  const timeRemainingRef = useRef(0);
+  const [manualPulseCard, setManualPulseCard] = useState(null);
+
+  const currentRecordRef = useRef(null);
+  const availableVoicesRef = useRef(availableVoices);
+  const studyStartIndexRef = useRef(0);
+  const studyStartRecordRef = useRef(null);
+  const shuffledRecordsRef = useRef([]);
+  const studyIndexRef = useRef(0);
+  const isRandomSessionRef = useRef(false);
+  const settingsFileInputRef = useRef(null);
+  const lastSpokenRef = useRef('');
+  const cachedVoiceRef = useRef(null);
+  const speechGenerationRef = useRef(0);
+  const voicesInitializedRef = useRef(false);
+  const mountedRef = useRef(true);
+
+  const failedCardsRef = useRef([]);
+  const expectingUserSpeechRef = useRef(false);
+  const expectedWordRef = useRef('');
+  const currentRepeatIndexRef = useRef(0);
+  const totalRepeatsRef = useRef(1);
+  const currentWordRef = useRef('');
+  const currentTranslationRef = useRef('');
+  const currentCardTypeRef = useRef('singular');
+  const currentCardIndexRef = useRef(0);
+
+  const navRepeatActiveRef = useRef(false);
+  const navRepeatCardTypeRef = useRef('singular');
+
+  const transcriptBaselineRef = useRef(0);
+  const listenStartedAtRef = useRef(0);
+  const lastTranscriptLengthRef = useRef(0);
+
+  const speakTextRef = useRef(null);
+  const startRepeatListeningRef = useRef(null);
+  const pronounceAndMaybeListenRef = useRef(null);
+  const finishNavRepeatRef = useRef(null);
+  const speakTranslationThenDoneRef = useRef(null);
+
+  const initialAutoLoadAttemptedRef = useRef(false);
+  const initialLoadResolvedRef = useRef(false);
+
+  const topBarRef = useRef(null);
+
+  const singularContentRef = useRef(null);
+  const pluralContentRef = useRef(null);
+  const singularTranscriptionRef = useRef(null);
+  const pluralTranscriptionRef = useRef(null);
+  const singularTranslationRef = useRef(null);
+  const pluralTranslationRef = useRef(null);
+
+  const {
+    transcript,
+    listening,
+    resetTranscript,
+    browserSupportsSpeechRecognition,
+  } = useSpeechRecognition();
+
+  useEffect(() => { currentRecordRef.current = currentRecord; }, [currentRecord]);
+  useEffect(() => { listeningRef.current = listening; }, [listening]);
+  useEffect(() => { if (listening) sawListeningRef.current = true; }, [listening]);
+  useEffect(() => { if (isListeningForRepeat) console.log('[transcript]', JSON.stringify(transcript)); }, [transcript, isListeningForRepeat]);
+
+  useEffect(() => { console.log('[listen]', listening, 'expect', expectingUserSpeechRef.current, 'saw', sawListeningRef.current); }, [listening]);
+
+  useEffect(() => { activeCardRef.current = activeCard; }, [activeCard]);
+  useEffect(() => { currentIndexRef.current = currentIndex; }, [currentIndex]);
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
+  useEffect(() => { allRecordsRef.current = allRecords; }, [allRecords]);
+  useEffect(() => { isStudyingRef.current = isStudying; }, [isStudying]);
+  useEffect(() => { timeRemainingRef.current = timeRemaining; }, [timeRemaining]);
+  useEffect(() => { availableVoicesRef.current = availableVoices; }, [availableVoices]);
+  useEffect(() => { attentionVariantRef.current = attentionVariant; }, [attentionVariant]);
+
+  useEffect(() => {
+    document.body.classList.remove('light', 'dark');
+    document.body.classList.add(settings.theme);
+  }, [settings.theme]);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined' && window.speechSynthesis) {
+      synthRef.current = window.speechSynthesis;
+    }
+  }, []);
+
+  useEffect(() => {
+    initialLoadResolvedRef.current = initialLoadResolved;
+  }, [initialLoadResolved]);
+
+  useEffect(() => {
+    if (dbFileName) {
+      setCookie(DB_FILENAME_COOKIE, dbFileName, DB_FILENAME_COOKIE_MAX_AGE);
+    } else {
+      deleteCookie(DB_FILENAME_COOKIE);
+    }
+  }, [dbFileName]);
+
+  useEffect(() => {
+    const node = topBarRef.current;
+    if (!node || typeof ResizeObserver === 'undefined') {
+      const measure = () => {
+        if (topBarRef.current) {
+          setMeasuredTopBarHeight(topBarRef.current.offsetHeight);
+        }
+      };
+      measure();
+      window.addEventListener('resize', measure);
+      return () => window.removeEventListener('resize', measure);
+    }
+
+    const measure = () => {
+      const h = node.getBoundingClientRect().height;
+      setMeasuredTopBarHeight(h);
+    };
+
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(node);
+    window.addEventListener('resize', measure);
+    window.addEventListener('orientationchange', measure);
+
+    return () => {
+      ro.disconnect();
+      window.removeEventListener('resize', measure);
+      window.removeEventListener('orientationchange', measure);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const resolveInitialLoad = () => {
+      initialLoadResolvedRef.current = true;
+      setInitialLoadResolved(true);
+    };
+
+    setIsLoadingLessonsList(true);
+    setLessonsListError('');
+    fetch(LESSONS_INDEX_URL, { headers: { Accept: 'application/json' } })
+      .then((res) => {
+        if (!res.ok) throw new Error(`Server returned ${res.status}`);
+        return res.json();
+      })
+      .then((data) => {
+        if (cancelled) return;
+        const list = Array.isArray(data?.lessons) ? data.lessons : [];
+        setLessonsList(list);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setLessonsList([]);
+        setLessonsListError(err.message || 'Failed to load lessons list');
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoadingLessonsList(false);
+      });
+
+    if (initialAutoLoadAttemptedRef.current) {
+      return () => { cancelled = true; };
+    }
+    initialAutoLoadAttemptedRef.current = true;
+
+    const remembered = (getCookie(DB_FILENAME_COOKIE) || '').trim();
+
+    if (settingsRef.current.loadLessonLocally) {
+      if (remembered) {
+        setSettings((prev) => ({
+          ...prev,
+          selectedLessonFile: prev.selectedLessonFile || remembered,
+        }));
+      }
+      resolveInitialLoad();
+      return () => { cancelled = true; };
+    }
+
+    if (!remembered) {
+      setIsLessonPickerOpen(true);
+      resolveInitialLoad();
+      return () => { cancelled = true; };
+    }
+
+    const fileName = /\.(json|dbms)$/i.test(remembered)
+      ? remembered
+      : `${remembered}.json`;
+
+    setSettings((prev) => ({ ...prev, selectedLessonFile: fileName }));
+
+    loadDatabaseFromServer(fileName)
+      .then(() => {
+        resolveInitialLoad();
+      })
+      .catch(() => {
+        setIsLessonPickerOpen(true);
+        resolveInitialLoad();
+      });
+
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const isSpeechSupported = () =>
+    typeof window !== 'undefined' && window.speechSynthesis !== undefined;
+
+  const isRepeatCycleActive = () =>
+    isStudyingRef.current || navRepeatActiveRef.current;
+
+  const notify = (message) => {
+    if (settingsRef.current.hideAlerts) return;
+    alert(message);
+  };
+
+  const report = (message) => {
+    alert(message);
+  };
+
+  // Roll a new attention variant, avoiding an immediate repeat.
+  const rollAttentionVariant = useCallback(() => {
+    setAttentionVariant((prev) => {
+      const choices = ATTENTION_VARIANTS.filter((v) => v !== prev);
+      return choices[Math.floor(Math.random() * choices.length)];
+    });
+  }, []);
+
+  const cancelAllSpeech = () => {
+    speechGenerationRef.current++;
+    try { synthRef.current?.cancel(); } catch (err) { }
+    setIsSpeaking(false);
+  };
+
+  const stopRepeatListening = useCallback(() => {
+    expectingUserSpeechRef.current = false;
+    setIsListeningForRepeat(false);
+    setRepeatStatus('');
+    setRepeatProgress({ current: 0, total: 0 });
+    currentRepeatIndexRef.current = 0;
+    try { SpeechRecognitionLib.stopListening(); } catch (err) { }
+    try { SpeechRecognitionLib.abortListening(); } catch (err) { }
+    resetTranscript();
+  }, [resetTranscript]);
+
+  const cancelRepeatCycle = () => {
+    navRepeatActiveRef.current = false;
+    setNavRepeatActive(false);
+    cancelAllSpeech();
+    stopRepeatListening();
+    setLastRecognized('');
+    currentRepeatIndexRef.current = 0;
+    totalRepeatsRef.current = 1;
+    currentWordRef.current = '';
+    currentTranslationRef.current = '';
+    lastSpokenRef.current = '';
+
+    if (navRepeatCardTypeRef.current) {
+      setCardPulsing(navRepeatCardTypeRef.current, false);
+    }
+    setManualPulseCard(null);
+  };
+
+  const applyLoadedVoices = (voices) => {
+    setAvailableVoices(voices);
+    setVoicesLoaded(true);
+    setVoiceSupport(true);
+    setIsLoadingVoices(false);
+
+    const englishVoices = filterVoicesByLangPrefixes(voices, ENGLISH_LANG_PREFIXES);
+    const russianVoices = filterVoicesByLangPrefixes(voices, RUSSIAN_LANG_PREFIXES);
+
+    const currentSelected = settingsRef.current.selectedVoiceName || "";
+    const currentTranslation = settingsRef.current.translationVoiceName || "";
+
+    const nextSelectedVoiceName =
+      currentSelected || (pickRandom(englishVoices)?.name ?? pickRandom(voices)?.name ?? "");
+    const nextTranslationVoiceName =
+      currentTranslation || (pickRandom(russianVoices)?.name ?? "");
+
+    if (nextSelectedVoiceName !== currentSelected || nextTranslationVoiceName !== currentTranslation) {
+      setSettings(prev => ({
+        ...prev,
+        selectedVoiceName: prev.selectedVoiceName || nextSelectedVoiceName,
+        translationVoiceName: prev.translationVoiceName || nextTranslationVoiceName,
+      }));
+    }
+
+    if (nextSelectedVoiceName) {
+      const v = voices.find(x => x.name === nextSelectedVoiceName);
+      if (v) cachedVoiceRef.current = v;
+    }
+
+    notify(buildVoicesLoadedMessage(voices));
+  };
+
+  const loadVoices = () => {
+    if (!isSpeechSupported()) { setVoiceSupport(false); return; }
+    setIsLoadingVoices(true);
+    // ★ Ensure speaking flag is clean (voice-load fires dummy utterances)
+    setIsSpeaking(false);
+
+    const loadWebVoices = () => {
+      if (!mountedRef.current) return true;
+      const voices = synthRef.current ? synthRef.current.getVoices() : [];
+      if (voices && voices.length > 0) {
+        applyLoadedVoices(voices);
+        setIsSpeaking(false);
+        return true;
+      }
+      return false;
+    };
+
+    if (loadWebVoices()) return;
+
+    const handleVoicesChanged = () => {
+      if (!mountedRef.current) return;
+      const voices = synthRef.current ? synthRef.current.getVoices() : [];
+      if (voices && voices.length > 0) {
+        applyLoadedVoices(voices);
+        setIsSpeaking(false);
+        if (synthRef.current && synthRef.current.onvoiceschanged) {
+          synthRef.current.onvoiceschanged = null;
+        }
+      }
+    };
+
+    if (synthRef.current) {
+      synthRef.current.onvoiceschanged = handleVoicesChanged;
+      try {
+        const dummyUtterance = new SpeechSynthesisUtterance(' ');
+        synthRef.current.cancel();
+        synthRef.current.speak(dummyUtterance);
+        setTimeout(() => {
+          try { synthRef.current?.cancel(); } catch (err) { }
+          setIsSpeaking(false);   // ★ clear flag after dummy utterance
+        }, 150);
+      } catch (err) { console.warn('Error triggering voice loading:', err); }
+    }
+
+    let attempts = 0;
+    const retryLoad = () => {
+      if (!mountedRef.current) return;
+      if (attempts < 10) {
+        attempts++;
+        setTimeout(() => {
+          if (!mountedRef.current) return;
+          if (!voicesLoaded && loadWebVoices()) {
+            if (synthRef.current && synthRef.current.onvoiceschanged) {
+              synthRef.current.onvoiceschanged = null;
+            }
+            setIsLoadingVoices(false);
+            setIsSpeaking(false);
+          } else if (!voicesLoaded && attempts < 10) {
+            retryLoad();
+          } else if (!voicesLoaded && attempts >= 10) {
+            setIsLoadingVoices(false);
+            setIsSpeaking(false);   // ★
+            alert('⚠️ Could not load voices. Please tap the "Load Voices" button again.');
+          }
+        }, 500);
+      }
+    };
+
+    retryLoad();
+  };
+
+  useEffect(() => {
+    mountedRef.current = true;
+    if (!isSpeechSupported()) {
+      setVoiceSupport(false);
+      return () => { mountedRef.current = false; };
+    }
+    if (!voicesInitializedRef.current) {
+      voicesInitializedRef.current = true;
+      loadVoices();
+    }
+    return () => {
+      mountedRef.current = false;
+      if (synthRef.current && synthRef.current.onvoiceschanged) {
+        synthRef.current.onvoiceschanged = null;
+      }
+      const timeoutRef = voiceLoadTimeoutRef.current;
+      if (timeoutRef) clearTimeout(timeoutRef);
+      if (isSpeechSupported()) {
+        try { window.speechSynthesis.cancel(); } catch (err) { }
+      }
+    };
+  }, []);
+
+  const getCurrentVoice = (voiceName = null) => {
+    if (!isSpeechSupported()) return null;
+    const targetVoiceName = voiceName || userSelectedVoiceNameRef.current || settings.selectedVoiceName;
+    if (!targetVoiceName) return null;
+    const voices = availableVoicesRef.current;
+    if (cachedVoiceRef.current && cachedVoiceRef.current.name === targetVoiceName) {
+      return cachedVoiceRef.current;
+    }
+    let voice = voices.find(v => v.name === targetVoiceName);
+    if (!voice) {
+      const target = normalizeVoiceName(targetVoiceName);
+      voice = voices.find(v => normalizeVoiceName(v.name) === target);
+    }
+    if (voice) cachedVoiceRef.current = voice;
+    return voice || null;
+  };
+
+  const setCardPulsing = (cardType, isPulsing) => {
+    const cardElement = cardType === 'singular' ? singularCardRef.current : pluralCardRef.current;
+    if (cardElement) {
+      if (isPulsing) cardElement.classList.add('active-pulse');
+      else cardElement.classList.remove('active-pulse');
+    }
+  };
+
+  const clearManualPulse = () => {
+    if (manualPulseCard) {
+      setCardPulsing(manualPulseCard, false);
+      setManualPulseCard(null);
+    }
+  };
+
+  const speakText = (text, onComplete = null, voiceNameOverride = null,
+                     repeatCountOverride = null, onEachUtteranceEnd = null) => {
+    if (!text) { if (onComplete) onComplete(); return; }
+    if (!isSpeechSupported() || !synthRef.current) { if (onComplete) onComplete(); return; }
+
+    const myGeneration = ++speechGenerationRef.current;
+    const isStale = () => myGeneration !== speechGenerationRef.current;
+
+    try { synthRef.current.cancel(); } catch (err) { }
+
+    const currentVoice = getCurrentVoice(voiceNameOverride);
+    if (!currentVoice) { if (onComplete) onComplete(); return; }
+
+    const repeatCount = repeatCountOverride !== null ? repeatCountOverride : (settings.repeatTimes || 1);
+    setIsSpeaking(true);
+    let currentRepeatIndex = 0;
+
+    const speakNext = () => {
+      if (isStale()) return;
+      if (currentRepeatIndex >= repeatCount) {
+        if (isStale()) return;
+        setIsSpeaking(false);
+        if (onComplete) onComplete();
+        return;
+      }
+
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.voice = currentVoice;
+      utterance.rate = 0.9;
+      utterance.pitch = 1.0;
+      utterance.lang = currentVoice.lang;
+
+      utterance.onend = () => {
+        if (isStale()) return;
+        currentRepeatIndex++;
+        if (onEachUtteranceEnd) {
+          const handled = onEachUtteranceEnd(currentRepeatIndex, repeatCount);
+          if (handled === true) { setIsSpeaking(false); return; }
+        }
+        setTimeout(() => { if (isStale()) return; speakNext(); }, 800);
+      };
+
+      utterance.onerror = (event) => {
+        if (isStale()) return;
+        if (event.error === 'not-allowed' || event.error === 'interrupted') {
+          setTimeout(() => {
+            if (isStale()) return;
+            currentRepeatIndex++;
+            setTimeout(() => { if (isStale()) return; speakNext(); }, 500);
+          }, 200);
+        } else if (event.error === 'canceled') {
+          // superseded
+        } else {
+          setIsSpeaking(false);
+          if (onComplete) onComplete();
+        }
+      };
+
+      try { synthRef.current.speak(utterance); }
+      catch (err) {
+        if (isStale()) return;
+        setIsSpeaking(false);
+        if (onComplete) onComplete();
+      }
+    };
+
+    setTimeout(() => { if (isStale()) return; speakNext(); }, 100);
+  };
+
+  useEffect(() => { speakTextRef.current = speakText; });
+
+  const speakTranslationSmart = useCallback((text, onComplete = null) => {
+    if (!text || String(text).trim() === '') { if (onComplete) onComplete(); return; }
+
+    const segments = splitTranslationByScript(text);
+    if (segments.length === 0) { if (onComplete) onComplete(); return; }
+
+    const s = settingsRef.current;
+    const selectedVoiceName = s.selectedVoiceName || null;
+    const translationVoiceName = s.translationVoiceName || null;
+    const repeats = Math.max(1, s.translationRepeatTimes || 1);
+
+    if (segments.length === 1) {
+      const seg = segments[0];
+      const voiceName = seg.isLatin ? selectedVoiceName : translationVoiceName;
+      speakTextRef.current(seg.text, onComplete, voiceName, repeats);
+      return;
+    }
+
+    let idx = 0;
+    const speakNext = () => {
+      if (idx >= segments.length) {
+        if (onComplete) onComplete();
+        return;
+      }
+      const seg = segments[idx++];
+      const voiceName = seg.isLatin ? selectedVoiceName : translationVoiceName;
+      speakTextRef.current(seg.text, speakNext, voiceName, repeats);
+    };
+    speakNext();
+  }, []);
+
+  const startRepeatListening = useCallback((expectedWord) => {try {
+  SpeechRecognitionLib.startListening({ continuous: true, interimResults: true, language: 'en-US' });
+  console.log('[repeat] startListening returned');
+} catch (err) {
+  console.error('[repeat] startListening threw', err);
+}
+
+
+  if (typeof SpeechRecognitionLib?.startListening !== 'function') {
+    console.error('[Repeat] startListening unavailable');
+    setRepeatStatus('error');
+
+    try {
+  SpeechRecognitionLib.startListening({ continuous: true, interimResults: true, language: 'en-US' });
+  console.log('[repeat] startListening returned');
+} catch (err) {
+  console.error('[repeat] startListening threw', err);
+}
+
+    return;
+  }
+  if (!browserSupportsSpeechRecognition) { setRepeatStatus('error'); return; }
+
+  expectedWordRef.current = expectedWord;
+  expectingUserSpeechRef.current = true;
+  setIsListeningForRepeat(true);
+  setRepeatStatus('listening');
+  setRepeatProgress({
+    current: currentRepeatIndexRef.current + 1,
+    total: totalRepeatsRef.current,
+  });
+  setLastRecognized('');
+
+  sawListeningRef.current = false;
+  // ★ Clear previous transcript so a stale interim result cannot
+  //   immediately trigger the silence/retry path.
+  resetTranscript();
+  transcriptBaselineRef.current = 0;
+  lastTranscriptLengthRef.current = 0;
+  listenStartedAtRef.current = Date.now();
+
+  try {
+    SpeechRecognitionLib.startListening({
+      continuous: true,
+      interimResults: true,
+      language: 'en-US',
+    });
+  } catch (err) {
+    console.error('SpeechRecognition start failed:', err);
+    setRepeatStatus('error');
+  }
+}, [browserSupportsSpeechRecognition, resetTranscript]);
+
+  useEffect(() => { startRepeatListeningRef.current = startRepeatListening; });
+
+  const speakOneAndListen = useCallback((word, attemptIndex, totalAttempts) => {
+    if (!isRepeatCycleActive()) return;
+    // ★ Never listen if repeat mode is off — even if a stale ref says otherwise.
+    if (!settingsRef.current.repeatAfterMe) return;
+    currentRepeatIndexRef.current = attemptIndex;
+    totalRepeatsRef.current = totalAttempts;
+    speakTextRef.current(word, null, null, 1, () => {
+      if (!isRepeatCycleActive()) return true;
+      setTimeout(() => {
+        if (!isRepeatCycleActive()) return;
+        startRepeatListeningRef.current(word);
+      }, 400);
+      return true;
+    });
+  }, []);
+
+  const speakTranslationThenDone = useCallback((translation) => {
+    const step = () => {
+      if (isStudyingRef.current) {
+        moveToNextCardInStudy();
+      } else if (navRepeatActiveRef.current) {
+        finishNavRepeatRef.current?.();
+      }
+    };
+
+    const hasTranslation =
+      settingsRef.current.pronounceTranslation &&
+      !!translation && translation.trim() !== '';
+
+    if (!hasTranslation) { step(); return; }
+
+    speakTranslationSmart(translation, () => {
+      if (!isRepeatCycleActive()) return;
+      step();
+    });
+  }, [speakTranslationSmart]);
+
+  useEffect(() => {
+    speakTranslationThenDoneRef.current = speakTranslationThenDone;
+  }, [speakTranslationThenDone]);
+
+  const getWordForRecord = (record, cardType) => {
+    if (!record) return '';
+    return cardType === 'singular' ? (record.singular?.word || '') : (record.plural?.word || '');
+  };
+  const getTranslationForRecord = (record, cardType) => {
+    if (!record) return '';
+    return cardType === 'singular' ? (record.singular?.translation || '') : (record.plural?.translation || '');
+  };
+
+  const moveToNextCardInStudy = () => {
+    if (!isStudyingRef.current) return;
+    const records = isRandomSessionRef.current ? shuffledRecordsRef.current : allRecordsRef.current;
+    const currentIdx = isRandomSessionRef.current ? studyIndexRef.current : currentIndexRef.current;
+    const currentActive = activeCardRef.current;
+    setCardPulsing(currentActive, false);
+
+    if (currentActive === 'singular') {
+      setActiveCard('plural');
+      const record = records[currentIdx];
+      setTimeout(() => {
+        if (!isStudyingRef.current) return;
+        setCardPulsing('plural', true);
+        setTimeout(() => {
+          if (!isStudyingRef.current) return;
+          pronounceAndMaybeListenRef.current?.('plural', currentIdx, record);
+        }, 200);
+      }, 100);
+    } else {
+      if (currentIdx < records.length - 1) {
+        const nextIdx = currentIdx + 1;
+        if (isRandomSessionRef.current) {
+          studyIndexRef.current = nextIdx;
+          setCurrentRecord(records[nextIdx]);
+        } else {
+          setCurrentIndex(nextIdx);
+          setCurrentRecord(records[nextIdx]);
+        }
+        setActiveCard('singular');
+        const record = records[nextIdx];
+        setTimeout(() => {
+          if (!isStudyingRef.current) return;
+          setCardPulsing('singular', true);
+          setTimeout(() => {
+            if (!isStudyingRef.current) return;
+            pronounceAndMaybeListenRef.current?.('singular', nextIdx, record);
+          }, 200);
+        }, 100);
+      } else {
+        setCardPulsing('plural', false);
+        resetStudyState(true);
+      }
+    }
+  };
+
+  const pronounceAndMaybeListen = (cardType, index, record) => {
+    if (!settings.autoPronounce) return;
+    if (!isStudyingRef.current) return;
+
+    const word = getWordForRecord(record, cardType);
+    const translation = getTranslationForRecord(record, cardType);
+
+    const hasWord = !!word && word.trim() !== '';
+    const hasTranslation =
+      !!translation && translation.trim() !== '' && settings.pronounceTranslation;
+
+    if (!hasWord && !hasTranslation) {
+      setTimeout(() => moveToNextCardInStudy(), 300);
+      return;
+    }
+
+    const key = `${index}_${cardType}`;
+    if (lastSpokenRef.current === key) return;
+    lastSpokenRef.current = key;
+
+    currentCardTypeRef.current = cardType;
+    currentCardIndexRef.current = index;
+    currentWordRef.current = word;
+    currentTranslationRef.current = translation;
+
+    const repeatAfterMe = settings.repeatAfterMe;
+    const totalRepeats = Math.max(1, settings.repeatTimes || 1);
+
+    totalRepeatsRef.current = totalRepeats;
+
+    if (repeatAfterMe) {
+      if (!hasWord) {
+        if (hasTranslation) {
+          speakTranslationThenDoneRef.current?.(translation);
+        } else {
+          setTimeout(() => moveToNextCardInStudy(), 300);
+        }
+        return;
+      }
+      speakOneAndListen(word, 0, totalRepeats);
+      return;
+    }
+
+    if (!hasWord) {
+      speakTranslationSmart(translation, () => {
+        if (!isStudyingRef.current) return;
+        setTimeout(() => moveToNextCardInStudy(), 300);
+      });
+      return;
+    }
+
+    if (hasTranslation) {
+      speakTextRef.current(word, () => {
+        if (!isStudyingRef.current) return;
+        setTimeout(() => {
+          if (!isStudyingRef.current) return;
+          speakTranslationSmart(translation, () => {
+            if (!isStudyingRef.current) return;
+            setTimeout(() => moveToNextCardInStudy(), 300);
+          });
+        }, 400);
+      });
+    } else {
+      speakTextRef.current(word, () => {
+        if (!isStudyingRef.current) return;
+        setTimeout(() => moveToNextCardInStudy(), 300);
+      });
+    }
+  };
+
+  useEffect(() => { pronounceAndMaybeListenRef.current = pronounceAndMaybeListen; });
+
+  const finishNavRepeat = useCallback(() => {
+    navRepeatActiveRef.current = false;
+    setNavRepeatActive(false);
+    cancelAllSpeech();
+    stopRepeatListening();
+    setLastRecognized('');
+    currentRepeatIndexRef.current = 0;
+    totalRepeatsRef.current = 1;
+    currentWordRef.current = '';
+    currentTranslationRef.current = '';
+    setCardPulsing(navRepeatCardTypeRef.current, false);
+    setManualPulseCard(null);
+  }, [stopRepeatListening]);
+
+  useEffect(() => { finishNavRepeatRef.current = finishNavRepeat; }, [finishNavRepeat]);
+
+  const startNavRepeatCycle = useCallback((cardType, word) => {
+    if (!browserSupportsSpeechRecognition) {
+      alert('⚠️ Repeat-after-me requires browser speech recognition, which is not supported in this browser.');
+      return;
+    }
+    if (!word || word.trim() === '') return;
+    if (!voicesLoaded || !settings.selectedVoiceName) {
+      alert('⚠️ Please load voices and select a voice in Settings before using repeat-after-me.');
+      return;
+    }
+
+    cancelRepeatCycle();
+
+    navRepeatActiveRef.current = true;
+    setNavRepeatActive(true);
+    navRepeatCardTypeRef.current = cardType;
+
+    currentCardTypeRef.current = cardType;
+    currentWordRef.current = word;
+    lastSpokenRef.current = `${currentIndexRef.current}_${cardType}`;
+
+    const rec = currentRecordRef.current;
+    currentTranslationRef.current = getTranslationForRecord(rec, cardType);
+
+    const totalAttempts = Math.max(1, settings.repeatTimes || 1);
+    totalRepeatsRef.current = totalAttempts;
+
+    clearManualPulse();
+    setCardPulsing(cardType, true);
+    setManualPulseCard(cardType);
+
+    speakOneAndListen(word, 0, totalAttempts);
+  }, [browserSupportsSpeechRecognition, voicesLoaded, settings.selectedVoiceName,
+      settings.repeatTimes, clearManualPulse]);
+
+  const startNavRepeatCycleRef = useRef(null);
+
+  useEffect(() => {
+    startNavRepeatCycleRef.current = startNavRepeatCycle;
+  }, [startNavRepeatCycle]);
+
+  const resetStudyState = (showCompletionAlert = false) => {
+    if (isCompletingRef.current) return;
+    if (timerIntervalRef.current) {
+      clearInterval(timerIntervalRef.current);
+      timerIntervalRef.current = null;
+    }
+    cancelAllSpeech();
+    stopRepeatListening();
+
+    navRepeatActiveRef.current = false;
+    setNavRepeatActive(false);
+
+    setIsStudying(false);
+    setTimeRemaining(0);
+    timeRemainingRef.current = 0;
+    lastSpokenRef.current = '';
+    currentRepeatIndexRef.current = 0;
+    totalRepeatsRef.current = 1;
+    currentWordRef.current = '';
+    currentTranslationRef.current = '';
+    setLastRecognized('');
+
+    if (isRandomSessionRef.current) {
+      if (studyStartRecordRef.current) {
+        setCurrentIndex(studyStartIndexRef.current);
+        setCurrentRecord(studyStartRecordRef.current);
+      }
+      isRandomSessionRef.current = false;
+      shuffledRecordsRef.current = [];
+      studyIndexRef.current = 0;
+    } else {
+      if (showCompletionAlert && studyStartRecordRef.current) {
+        setCurrentIndex(studyStartIndexRef.current);
+        setCurrentRecord(studyStartRecordRef.current);
+      }
+    }
+
+    setActiveCard('singular');
+    setCardPulsing('singular', false);
+    setCardPulsing('plural', false);
+    clearManualPulse();
+
+    // ★ Re-roll the standby attention animation on every break
+    rollAttentionVariant();
+
+    if (showCompletionAlert && !completionAlertShownRef.current) {
+      if (settingsRef.current.repeatAfterMe && !navRepeatActiveRef.current) {
+        flushAutoBuffer();
+      }
+
+      isCompletingRef.current = true;
+      completionAlertShownRef.current = true;
+
+      const failed = failedCardsRef.current;
+
+      if (settingsRef.current.repeatAfterMe && failed.length > 0) {
+        const lines = failed.map((entry, i) => {
+          const heard = entry.heard && entry.heard.trim() !== ''
+            ? ` "${entry.heard}"`
+            : '';
+          return `${i + 1}. ${entry.word} -${heard}`;
+        });
+
+        report(
+          `🎉 Repeat After Me session completed!\n\n` +
+          `Not passed ${failed.length} card(s):\n` +
+          lines.join('\n')
+        );
+      } else if (settingsRef.current.repeatAfterMe) {
+        report('🎉 Repeat After Me session completed!\n\nAll cards passed!');
+      } else {
+        report('🎉 Study session completed! Well done!');
+      }
+
+      failedCardsRef.current = [];
+
+      setTimeout(() => {
+        completionAlertShownRef.current = false;
+        isCompletingRef.current = false;
+      }, 500);
+    }
+  };
+
+  const shuffleArray = (array) => {
+    const arr = [...array];
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  };
+
+  const startStudyTimer = () => {
+    if (timerIntervalRef.current) { clearInterval(timerIntervalRef.current); timerIntervalRef.current = null; }
+
+    // ★ Force-clear any lingering repeat state so the pill can't show 🎤
+    //   during a non-repeat session on slow engines (Android).
+    setIsListeningForRepeat(false);
+    setIsSpeaking(false);
+
+    studyStartIndexRef.current = currentIndex;
+    studyStartRecordRef.current = currentRecord;
+
+    cancelAllSpeech();
+    stopRepeatListening();
+    navRepeatActiveRef.current = false;
+    setNavRepeatActive(false);
+    setTimeRemaining(0);
+    timeRemainingRef.current = 0;
+    lastSpokenRef.current = '';
+    currentRepeatIndexRef.current = 0;
+    setLastRecognized('');
+
+    completionAlertShownRef.current = false;
+    isCompletingRef.current = false;
+
+    failedCardsRef.current = [];
+
+    let firstRecord = currentRecord;
+    let firstIndex = currentIndex;
+
+    if (settings.randomOrder && allRecords.length > 0) {
+      const shuffled = shuffleArray(allRecords);
+      shuffledRecordsRef.current = shuffled;
+      isRandomSessionRef.current = true;
+      studyIndexRef.current = 0;
+      firstRecord = shuffled[0];
+      firstIndex = 0;
+      setCurrentRecord(shuffled[0]);
+    } else {
+      isRandomSessionRef.current = false;
+      firstIndex = currentIndex;
+      firstRecord = allRecords[currentIndex];
+    }
+
+    setCardPulsing('singular', false);
+    setCardPulsing('plural', false);
+    clearManualPulse();
+
+    setIsStudying(true);
+    isStudyingRef.current = true;
+    setActiveCard('singular');
+    setCardPulsing('singular', true);
+
+    if (!settings.autoPronounce) {
+      const initialTime = settingsRef.current.studyTime;
+      setTimeRemaining(initialTime);
+      timeRemainingRef.current = initialTime;
+
+      timerIntervalRef.current = setInterval(() => {
+        if (!isStudyingRef.current) {
+          if (timerIntervalRef.current) { clearInterval(timerIntervalRef.current); timerIntervalRef.current = null; }
+          return;
+        }
+        const currentTime = timeRemainingRef.current;
+        if (currentTime <= 1) {
+          const records = isRandomSessionRef.current ? shuffledRecordsRef.current : allRecordsRef.current;
+          const currentIdx = isRandomSessionRef.current ? studyIndexRef.current : currentIndexRef.current;
+          setCardPulsing(activeCardRef.current, false);
+          if (activeCardRef.current === 'singular') {
+            setActiveCard('plural');
+            setTimeout(() => setCardPulsing('plural', true), 100);
+          } else {
+            if (currentIdx < records.length - 1) {
+              const nextIdx = currentIdx + 1;
+              if (isRandomSessionRef.current) {
+                studyIndexRef.current = nextIdx;
+                setCurrentRecord(records[nextIdx]);
+              } else {
+                setCurrentIndex(nextIdx);
+                setCurrentRecord(records[nextIdx]);
+              }
+              setActiveCard('singular');
+              setTimeout(() => setCardPulsing('singular', true), 100);
+            } else {
+              resetStudyState(true);
+              if (timerIntervalRef.current) { clearInterval(timerIntervalRef.current); timerIntervalRef.current = null; }
+              return;
+            }
+          }
+          const newTime = settingsRef.current.studyTime;
+          setTimeRemaining(newTime);
+          timeRemainingRef.current = newTime;
+        } else {
+          const newTime = currentTime - 1;
+          setTimeRemaining(newTime);
+          timeRemainingRef.current = newTime;
+        }
+      }, 1000);
+    } else {
+      setTimeout(() => {
+        if (!isStudyingRef.current) return;
+        pronounceAndMaybeListenRef.current?.('singular', firstIndex, firstRecord);
+      }, 500);
+    }
+  };
+
+  const stopStudyTimer = () => {
+    if (timerIntervalRef.current) { clearInterval(timerIntervalRef.current); timerIntervalRef.current = null; }
+    resetStudyState(false);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
+      const timeoutRef = voiceLoadTimeoutRef.current;
+      if (timeoutRef) clearTimeout(timeoutRef);
+      speechGenerationRef.current++;
+      if (isSpeechSupported() && synthRef.current) {
+        try { synthRef.current.cancel(); } catch (err) { }
+      }
+      try { SpeechRecognitionLib.abortListening(); } catch (err) { }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isListeningForRepeat) return;
+    if (!transcript || transcript.trim() === '') return;
+    if (transcript.length <= transcriptBaselineRef.current) return;
+
+    const elapsed = Date.now() - listenStartedAtRef.current;
+    const remaining = Math.max(0, LISTEN_MIN_MS - elapsed);
+
+    const snapshotLength = transcript.length;
+    lastTranscriptLengthRef.current = snapshotLength;
+
+    const handle = setTimeout(() => {
+      if (transcript.length !== lastTranscriptLengthRef.current) return;
+
+      const expected = expectedWordRef.current;
+      const spoken = transcript;
+      const wordsSinceBaseline = spoken.slice(transcriptBaselineRef.current);
+      const chunk = lastWords(wordsSinceBaseline, TRANSCRIPT_CHUNK_WORDS);
+      const cleaned = stripTrailingPunctuation(chunk);
+      setLastRecognized(cleaned);
+
+      const ratio = similarityRatio(expected, chunk);
+      const letterMatch = isLetterMatch(expected, chunk);
+      const repeatedLetterMatch = isRepeatedLetterMatch(expected, chunk);
+      const repeatedWordMatch = isRepeatedWordMatch(expected, chunk);
+      const attemptIndex = currentRepeatIndexRef.current;
+      const totalAttempts = totalRepeatsRef.current;
+
+      if (ratio >= 0.7 || letterMatch || repeatedLetterMatch || repeatedWordMatch) {
+        setIsListeningForRepeat(false);
+        expectingUserSpeechRef.current = false;
+        try { SpeechRecognitionLib.stopListening(); } catch (err) { }
+        const isLastAttempt = attemptIndex + 1 >= totalAttempts;
+        setRepeatStatus('matched');
+        setRepeatProgress({ current: attemptIndex + 1, total: totalAttempts });
+
+        recordAttempt(
+          { word: expected, heard: cleaned || '', matched: true },
+          { immediate: navRepeatActiveRef.current }
+        );
+
+        if (isLastAttempt) {
+          setTimeout(() => {
+            setRepeatStatus('');
+            setRepeatProgress({ current: 0, total: 0 });
+            speakTranslationThenDoneRef.current?.(currentTranslationRef.current || '');
+          }, 700);
+        } else {
+          setTimeout(() => {
+            if (!isRepeatCycleActive()) return;
+            speakOneAndListen(expected, attemptIndex + 1, totalAttempts);
+          }, 500);
+        }
+      } else {
+        setIsListeningForRepeat(false);
+        expectingUserSpeechRef.current = false;
+        try { SpeechRecognitionLib.stopListening(); } catch (err) { }
+        setRepeatStatus('retry');
+        setRepeatProgress({ current: attemptIndex + 1, total: totalAttempts });
+
+        recordAttempt(
+          { word: expected, heard: cleaned || '', matched: false },
+          { immediate: navRepeatActiveRef.current }
+        );
+
+        setTimeout(() => {
+          if (!isRepeatCycleActive()) return;
+          const isLastAttempt = attemptIndex + 1 >= totalAttempts;
+
+          if (settingsRef.current.repeatOnWordsNotEqual) {
+            speakOneAndListen(expected, attemptIndex, totalAttempts);
+          } else {
+            if (isLastAttempt) {
+              if (settingsRef.current.repeatAfterMe && isStudyingRef.current) {
+                failedCardsRef.current.push({
+                  word: expected,
+                  heard: cleaned || '',
+                });
+              }
+              setRepeatStatus('');
+              setRepeatProgress({ current: 0, total: 0 });
+              if (isStudyingRef.current) {
+                moveToNextCardInStudy();
+              } else if (navRepeatActiveRef.current) {
+                finishNavRepeatRef.current?.();
+              }
+            } else {
+              speakOneAndListen(expected, attemptIndex + 1, totalAttempts);
+            }
+          }
+        }, 700);
+      }
+    }, Math.max(remaining, SILENCE_DEBOUNCE_MS));
+
+    return () => clearTimeout(handle);
+  }, [transcript, isListeningForRepeat, resetTranscript, speakOneAndListen]);
+
+  useEffect(() => {
+  if (!expectingUserSpeechRef.current) return;
+  if (!isListeningForRepeat) return;
+  if (listening) return;
+  if (!sawListeningRef.current) return;
+
+  // ★ Grace period: only arm the silence timer after the engine has had
+  //   a real chance to report listening=true AND the transcript hasn't
+  //   grown. This prevents the "instant Retry" race on Android/Chrome.
+  const GRACE_MS = 2500;
+  const elapsed = Date.now() - listenStartedAtRef.current;
+  const wait = Math.max(GRACE_MS - elapsed, 1500);
+
+  const handle = setTimeout(() => {
+    if (!expectingUserSpeechRef.current) return;
+    if (!isListeningForRepeat) return;
+    if (listeningRef.current) return;                        // re-check via ref
+    if (transcript && transcript.length > transcriptBaselineRef.current) return;
+
+    setRepeatStatus('retry');
+    setIsListeningForRepeat(false);
+    expectingUserSpeechRef.current = false;
+    try { SpeechRecognitionLib.stopListening(); } catch (_) {}
+
+    const attemptIndex = currentRepeatIndexRef.current;
+    const totalAttempts = totalRepeatsRef.current;
+    const word = currentWordRef.current;
+
+    recordAttempt(
+      { word, heard: '', matched: false },
+      { immediate: navRepeatActiveRef.current }
+    );
+
+    setTimeout(() => {
+      if (!isRepeatCycleActive()) return;
+      const isLastAttempt = attemptIndex + 1 >= totalAttempts;
+
+      if (settingsRef.current.repeatOnWordsNotEqual) {
+        speakOneAndListen(word, attemptIndex, totalAttempts);
+      } else if (isLastAttempt) {
+        if (settingsRef.current.repeatAfterMe && isStudyingRef.current) {
+          failedCardsRef.current.push({ word, heard: '' });
+        }
+        setRepeatStatus('');
+        setRepeatProgress({ current: 0, total: 0 });
+        if (isStudyingRef.current) moveToNextCardInStudy();
+        else if (navRepeatActiveRef.current) finishNavRepeatRef.current?.();
+      } else {
+        speakOneAndListen(word, attemptIndex + 1, totalAttempts);
+      }
+    }, 600);
+  }, wait);
+
+  return () => clearTimeout(handle);
+}, [listening, isListeningForRepeat, speakOneAndListen, transcript]);
+
+  const openSettings = () => setIsSettingsOpen(true);
+  const closeSettings = () => setIsSettingsOpen(false);
+  const toggleTheme = () => handleSettingChange('theme', settings.theme === 'dark' ? 'light' : 'dark');
+  const handleOpenSettingsFile = () => { if (settingsFileInputRef.current) settingsFileInputRef.current.click(); };
+
+  const openStats = async () => {
+    setIsStatsOpen(true);
+    setIsLoadingStats(true);
+    setStatsError('');
+    try {
+      const data = await fetchStats();
+      setStatsData(data);
+    } catch (err) {
+      setStatsError(err.message || 'Failed to load statistics');
+      setStatsData(null);
+    } finally {
+      setIsLoadingStats(false);
+    }
+  };
+
+  const closeStats = () => setIsStatsOpen(false);
+
+  // ── Share Eco Cards link ──────────────────────────────────────
+  // Mobile (Android / iOS): use the Web Share API so the native
+  //   app picker appears (WhatsApp, Telegram, Mail, …).
+  // Desktop (Windows / macOS / Linux): skip navigator.share()
+  //   entirely and copy the URL to the clipboard. This sidesteps
+  //   the unreliable Windows 10 share sheet, where Teams/Outlook
+  //   often receive the message body without a usable link.
+  const shareEcoCards = async () => {
+    const url = window.location.href;
+
+    const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+
+    const copyToClipboard = async () => {
+      try {
+        await navigator.clipboard.writeText(url);
+        alert('Eco Cards link copied to clipboard.');
+        return;
+      } catch (_) { /* fall through to legacy */ }
+
+      // Legacy fallback for older browsers / non-secure contexts
+      const ta = document.createElement('textarea');
+      ta.value = url;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); } catch (_) { /* noop */ }
+      document.body.removeChild(ta);
+      alert('Eco Cards link copied to clipboard.');
+    };
+
+    // ── Desktop: always clipboard ──
+    if (!isMobile) {
+      await copyToClipboard();
+      return;
+    }
+
+    // ── Mobile: prefer native share, fall back to clipboard ──
+    if (navigator.share) {
+      try {
+        await navigator.share({
+          title: 'Eco Cards',
+          url,
+        });
+        return;                                        // success — nothing more
+      } catch (err) {
+        if (err && err.name === 'AbortError') return;  // user cancelled
+        // NotAllowedError, DataError, etc. → clipboard fallback
+        await copyToClipboard();
+        return;
+      }
+    }
+
+    await copyToClipboard();
+  };
+
+  const SETTINGS_SCHEMA = {
+    autoAlign: { type: 'boolean', default: true },
+    topPanelWidth: { type: 'number', min: 300, max: 2000, default: 916 },
+    cardWidth: { type: 'number', min: 150, max: 800, default: 400 },
+    cardHeight: { type: 'number', min: 150, max: 800, default: 400 },
+    cardGap: { type: 'number', min: 5, max: 100, default: 10 },
+    fontSize: { type: 'number', min: 8, max: 48, default: 32 },
+    showSvgBorder: { type: 'boolean', default: false },
+    showTranscription: { type: 'boolean', default: true },
+    showTranslation: { type: 'boolean', default: true },
+    loadLessonLocally: { type: 'boolean', default: false },
+    selectedLessonFile: { type: 'string', maxLength: 200, default: '' },
+    theme: { type: 'enum', values: ['dark', 'light'], default: 'dark' },
+    studyTime: { type: 'number', min: 3, max: 60, default: 10 },
+    selectedVoiceName: { type: 'string', maxLength: 200, default: '' },
+    repeatTimes: { type: 'number', min: 1, max: 5, default: 3 },
+    autoPronounce: { type: 'boolean', default: true },
+    pronounceTranslation: { type: 'boolean', default: true },
+    translationVoiceName: { type: 'string', maxLength: 200, default: '' },
+    translationRepeatTimes: { type: 'number', min: 1, max: 5, default: 3 },
+    randomOrder: { type: 'boolean', default: true },
+    repeatAfterMe: { type: 'boolean', default: false },
+    repeatOnWordsNotEqual: { type: 'boolean', default: false },
+    hideAlerts: { type: 'boolean', default: true },
+    invisibleTopBar: { type: 'boolean', default: true },
+    hideOptionsBelow: { type: 'boolean', default: true },
+  };
+
+  const validateSettings = (raw) => {
+    const valid = {};
+    const rejected = [];
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { valid, rejected: ['(not an object)'] };
+    }
+    Object.keys(raw).forEach((key) => {
+      const rule = SETTINGS_SCHEMA[key];
+      if (!rule) return;
+      const value = raw[key];
+      if (rule.type === 'number') {
+        const n = typeof value === 'number' ? value : Number(value);
+        if (!Number.isFinite(n)) { rejected.push(`${key} (not a number)`); return; }
+        if (n < rule.min || n > rule.max) {
+          rejected.push(`${key} (out of range: ${n}, allowed ${rule.min}–${rule.max})`);
+          return;
+        }
+        valid[key] = n; return;
+      }
+      if (rule.type === 'boolean') {
+        if (typeof value !== 'boolean') { rejected.push(`${key} (not a boolean)`); return; }
+        valid[key] = value; return;
+      }
+      if (rule.type === 'string') {
+        if (typeof value !== 'string') { rejected.push(`${key} (not a string)`); return; }
+        if (rule.maxLength && value.length > rule.maxLength) {
+          rejected.push(`${key} (too long: ${value.length} chars)`); return;
+        }
+        valid[key] = value; return;
+      }
+      if (rule.type === 'enum') {
+        if (!rule.values.includes(value)) {
+          rejected.push(`${key} (invalid value: "${value}", allowed: ${rule.values.join(', ')})`);
+          return;
+        }
+        valid[key] = value; return;
+      }
+    });
+    return { valid, rejected };
+  };
+
+  const loadSettingsFromFile = (file) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const parsed = JSON.parse(e.target.result);
+        const { valid, rejected } = validateSettings(parsed);
+
+        // ★ Never restore session-critical flags from a settings file:
+        //   the user must always toggle "Repeat after me" manually in
+        //   the current session. Otherwise a stale saved .settings file
+        //   can silently re-enable repeat mode and the pill will show 🎤
+        //   during a normal auto-pronounce study (observed on Android).
+        SESSION_ONLY_KEYS.forEach((k) => { delete valid[k]; });
+
+        const newSettings = { ...settings, ...valid };
+        if (rejected.length > 0) console.warn('[Settings] Rejected invalid fields:', rejected);
+        setSettings(newSettings);
+        userSelectedVoiceNameRef.current = newSettings.selectedVoiceName || "";
+        cachedVoiceRef.current = null;
+        if (rejected.length > 0) {
+          alert(
+            `⚠️ Settings loaded with warnings\n\n` +
+            `${rejected.length} field(s) were rejected and reverted to defaults:\n\n` +
+            rejected.map((r) => `• ${r}`).join('\n')
+          );
+        } else {
+          notify('✅ Settings loaded successfully!');
+        }
+      } catch (err) { alert('❌ Failed to parse settings file.'); }
+    };
+    reader.readAsText(file);
+  };
+
+  const applyAndClose = () => {
+    if (isStudying) { stopStudyTimer(); setTimeout(() => startStudyTimer(), 100); }
+    closeSettings();
+  };
+
+  const saveSettings = async () => {
+    if (isStudying) { stopStudyTimer(); setTimeout(() => startStudyTimer(), 100); }
+    const settingsToSave = {
+      ...settings,
+      dbFileName: dbLoaded ? dbFileName : "",
+      savedAt: new Date().toISOString()
+    };
+    const jsonStr = JSON.stringify(settingsToSave, null, 2);
+    const blob = new Blob([jsonStr], { type: 'application/json' });
+
+    if ('showSaveFilePicker' in window) {
+      try {
+        const fileHandle = await window.showSaveFilePicker({
+          suggestedName: 'cards.settings',
+          types: [{ description: 'Settings File', accept: { 'application/json': ['.settings'] } }]
+        });
+        const writable = await fileHandle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+        notify('Settings saved successfully!');
+        closeSettings();
+        return;
+      } catch (err) {
+        if (err.name !== 'AbortError') console.warn('Save file picker error:', err);
+      }
+    }
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'cards.settings';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    notify('Settings saved successfully!');
+    closeSettings();
+  };
+
+  const handleSettingChange = (key, value) => setSettings(prev => ({ ...prev, [key]: value }));
+
+  const handleRepeatAfterMeToggle = (checked) => {
+    setSettings(prev => ({
+      ...prev,
+      repeatAfterMe: checked,
+      ...(checked ? { repeatTimes: 1 } : {}),
+    }));
+  };
+
+  const handleVoiceChange = (voiceName) => {
+    cancelAllSpeech();
+    userSelectedVoiceNameRef.current = voiceName;
+    setSettings(prev => ({ ...prev, selectedVoiceName: voiceName }));
+    if (voiceName) {
+      const voice = availableVoicesRef.current.find(v => v.name === voiceName);
+      if (voice) {
+        cachedVoiceRef.current = voice;
+        const testText = "Hello! Voice selected successfully.";
+        try {
+          if (synthRef.current) {
+            synthRef.current.cancel();
+            const utterance = new SpeechSynthesisUtterance(testText);
+            utterance.voice = voice;
+            utterance.rate = 0.9;
+            utterance.pitch = 1.0;
+            synthRef.current.speak(utterance);
+          }
+        } catch (err) { console.error('Error testing voice:', err); }
+      }
+    } else {
+      cachedVoiceRef.current = null;
+    }
+  };
+
+  const handleMainAction = () => {
+    if (!isStudying && isSpeaking) {
+      alert('⚠️ Please wait for current pronunciation to finish before starting a study session.');
+      return;
+    }
+    if (isStudying) { stopStudyTimer(); return; }
+
+    console.log('[repeat] guard', { dbLoaded, allRecords: allRecords.length, voicesLoaded, selectedVoiceName: settings.selectedVoiceName, browserSupportsSpeechRecognition, repeatAfterMe: settings.repeatAfterMe });
+
+    console.log('[handleMainAction]', { dbLoaded, records: allRecords.length, voicesLoaded, selectedVoiceName: settings.selectedVoiceName, browserSupportsSpeechRecognition, repeatAfterMe: settings.repeatAfterMe, autoPronounce: settings.autoPronounce });
+
+    if (!dbLoaded || allRecords.length === 0) {
+      alert('⚠️ No database loaded!\n\nPlease load a database file using the "Load DB" button before starting a study session.');
+      return;
+    }
+    if (!isSpeechSupported()) {
+      alert('⚠️ Your browser does not support speech synthesis.\n\nPlease use a different browser.');
+      return;
+    }
+    if (settings.autoPronounce && (!voicesLoaded || availableVoices.length === 0)) {
+      alert('⚠️ Voices not loaded yet!\n\nPlease click the "Load Voices" button in Settings first.');
+      return;
+    }
+    if (settings.autoPronounce && !settings.selectedVoiceName) {
+      alert('⚠️ Please select a voice in Settings before starting the study session.');
+      return;
+    }
+    if (settings.repeatAfterMe && !browserSupportsSpeechRecognition) {
+      alert('⚠️ Repeat-after-me requires browser speech recognition, which is not supported in this browser.');
+      return;
+    }
+
+
+
+    console.log('[handleMainAction]', { dbLoaded, records: allRecords.length, voicesLoaded, selectedVoiceName: settings.selectedVoiceName, browserSupportsSpeechRecognition, repeatAfterMe: settings.repeatAfterMe, autoPronounce: settings.autoPronounce });    if (dbLoaded && allRecords.length > 0) {
+      if (navRepeatActiveRef.current) cancelRepeatCycle();
+      startStudyTimer();
+      let modeMsg = '';
+      if (settings.repeatAfterMe) {
+        modeMsg = `🎤 Repeat-after-me mode:\n• Word is pronounced ${settings.repeatTimes} time(s)\n• After EACH pronunciation the mic listens\n• If each attempt matches, the study advances\n• If not, the same attempt repeats\n• ${settings.pronounceTranslation ? 'Translation is spoken after the word is matched' : 'Translation pronunciation is OFF'}${settings.randomOrder ? '\n\n🔀 Random order enabled.' : ''}`;
+      } else if (settings.autoPronounce && settings.selectedVoiceName) {
+        modeMsg = `🔊 Auto-pronunciation mode: Each card will be pronounced and auto-advance\n${settings.pronounceTranslation ? '🌐 Translation will also be pronounced\n' : ''}⏱️ No timer - progress after pronunciation completes${settings.randomOrder ? '\n\n🔀 Random order enabled.' : ''}`;
+      } else {
+        modeMsg = `⏱️ Timer mode: ${settings.studyTime} seconds per card\n🔇 Auto-pronunciation disabled${settings.randomOrder ? '\n\n🔀 Random order enabled.' : ''}`;
+      }
+      notify(`📖 Study session started!\n\n${modeMsg}`);
+    }
+  };
+
+  const DANGEROUS_SVG_TAGS = [
+    'script', 'foreignObject', 'iframe', 'object', 'embed',
+    'audio', 'video', 'source', 'track',
+    'animate', 'set', 'handler', 'listener',
+  ];
+  const DANGEROUS_ATTR_PREFIXES = ['on'];
+  const DANGEROUS_ATTR_NAMES = ['src', 'data', 'formaction', 'action'];
+  const isSafeInternalReference = (value) => /^#[A-Za-z_][\w:.-]*$/.test(value.trim());
+
+  const SAFE_DATA_IMAGE_RE =
+    /^data:image\/(png|jpe?g|gif|webp|bmp|x-icon|vnd\.microsoft\.icon|svg\+xml);base64,[A-Za-z0-9+/=\s]+$/i;
+
+  const isSafeDataImage = (value) =>
+    typeof value === 'string' && SAFE_DATA_IMAGE_RE.test(value.trim());
+
+  const sanitizeSvgString = (rawSvg) => {
+    let cleaned = String(rawSvg || '')
+      .replace(/^\uFEFF/, '')
+      .replace(/<\?xml[\s\S]*?\?>/gi, '')
+      .trim();
+
+    const firstSvgMatch = cleaned.match(/<svg\b[\s\S]*?<\/svg\s*>/i);
+    if (firstSvgMatch) {
+      cleaned = firstSvgMatch[0];
+    } else if (!/^<svg\b/i.test(cleaned)) {
+      console.warn('[svg] no <svg> element found');
+      return null;
+    }
+
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(cleaned, 'image/svg+xml');
+
+    const parseErr =
+      doc.getElementsByTagName('parsererror')[0] ||
+      Array.from(doc.getElementsByTagName('*'))
+        .find(el => /parsererror/i.test(el.tagName));
+    if (parseErr) {
+      console.warn('[svg] parse error:', parseErr.textContent.slice(0, 300));
+      return null;
+    }
+
+    const svgEl = doc.documentElement;
+    if (!svgEl || svgEl.localName !== 'svg') {
+      console.warn('[svg] root element is not <svg>:', svgEl?.localName);
+      return null;
+    }
+
+    DANGEROUS_SVG_TAGS.forEach((tag) =>
+      doc.querySelectorAll(tag).forEach((el) => el.remove())
+    );
+
+    doc.querySelectorAll('use').forEach((useEl) => {
+      const href =
+        useEl.getAttribute('href') ||
+        useEl.getAttribute('xlink:href') ||
+        '';
+      if (!isSafeInternalReference(href)) useEl.remove();
+    });
+
+    doc.querySelectorAll('image').forEach((imgEl) => {
+      const href =
+        imgEl.getAttribute('href') ||
+        imgEl.getAttribute('xlink:href') ||
+        '';
+      if (!isSafeDataImage(href)) imgEl.remove();
+    });
+
+    [svgEl, ...doc.querySelectorAll('*')].forEach((el) => {
+      const attrsToRemove = [];
+      const tagName = el.tagName.toLowerCase();
+
+      Array.from(el.attributes).forEach((attr) => {
+        const name = attr.name.toLowerCase();
+        const value = (attr.value || '').trim();
+
+        if (DANGEROUS_ATTR_PREFIXES.some((p) => name.startsWith(p))) {
+          attrsToRemove.push(attr.name);
+          return;
+        }
+
+        if (name === 'href' || name === 'xlink:href') {
+          if (tagName === 'use') return;
+          if (tagName === 'image') {
+            if (isSafeDataImage(value)) return;
+            attrsToRemove.push(attr.name);
+            return;
+          }
+          if (!isSafeInternalReference(value)) attrsToRemove.push(attr.name);
+          return;
+        }
+
+        if (DANGEROUS_ATTR_NAMES.includes(name)) {
+          if (/^\s*(javascript|data|vbscript):/i.test(value)) {
+            attrsToRemove.push(attr.name);
+          }
+          return;
+        }
+
+        if (
+          name === 'style' &&
+          /url\s*\(\s*['"]?\s*javascript:/i.test(value)
+        ) {
+          attrsToRemove.push(attr.name);
+        }
+      });
+
+      attrsToRemove.forEach((a) => el.removeAttribute(a));
+    });
+
+    doc.querySelectorAll('style').forEach((styleEl) => {
+      styleEl.textContent = (styleEl.textContent || '').replace(
+        /@import[^;]+;/gi,
+        ''
+      );
+    });
+
+    svgEl.removeAttribute('baseProfile');
+    if (svgEl.getAttribute('version') === '1.2') {
+      svgEl.setAttribute('version', '1.1');
+    }
+
+    doc.querySelectorAll('text').forEach((t) => {
+      const ff = t.getAttribute('font-family') || '';
+      if (ff && !/(sans-serif|serif|monospace|system-ui)/i.test(ff)) {
+        t.setAttribute('font-family', `${ff}, sans-serif`);
+      }
+    });
+
+    return svgEl;
+  };
+
+  const CLASS_TOKEN_REGEX = /^st\d+$/;
+  const rewriteStyleContent = (cssText, scopeId) =>
+    cssText.replace(/\.st(\d+)(?![A-Za-z0-9_-])/g, `.${scopeId}-st$1`);
+  const rewriteClassAttribute = (classValue, scopeId) =>
+    classValue.split(/\s+/).filter(Boolean)
+      .map(token => (CLASS_TOKEN_REGEX.test(token) ? `${scopeId}-${token}` : token))
+      .join(' ');
+
+  const renderSvgToContainer = (container, svgCode, uniqueId) => {
+    if (!container) return;
+    container.replaceChildren();
+    if (!svgCode || svgCode.trim() === '') return;
+
+    const measure = document.createElement('div');
+    measure.style.cssText =
+      'position:absolute;left:-99999px;top:-99999px;' +
+      'visibility:hidden;pointer-events:none;';
+    document.body.appendChild(measure);
+
+    try {
+      const sanitizedSvg = sanitizeSvgString(svgCode);
+      if (!sanitizedSvg) return;
+
+      const vbAttr = sanitizedSvg.getAttribute('viewBox');
+      let vb = null;
+      if (vbAttr) {
+        const parts = vbAttr.trim().split(/[\s,]+/).map(Number);
+        if (parts.length === 4 && parts.every(Number.isFinite) && parts[2] > 0 && parts[3] > 0) {
+          vb = parts;
+        }
+      }
+      if (!vb) {
+        const wAttr = parseFloat(sanitizedSvg.getAttribute('width')) || 0;
+        const hAttr = parseFloat(sanitizedSvg.getAttribute('height')) || 0;
+        if (wAttr > 0 && hAttr > 0) {
+          vb = [0, 0, wAttr, hAttr];
+        } else {
+          sanitizedSvg.setAttribute('width', '100%');
+          sanitizedSvg.setAttribute('height', '100%');
+          sanitizedSvg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+          if (!vbAttr) sanitizedSvg.setAttribute('viewBox', '0 0 1000 1000');
+          container.appendChild(sanitizedSvg);
+          return;
+        }
+      }
+
+      const [vx, vy, vw, vh] = vb;
+
+      const tempSvg = sanitizedSvg.cloneNode(true);
+      tempSvg.setAttribute('width', String(vw));
+      tempSvg.setAttribute('height', String(vh));
+      tempSvg.setAttribute('viewBox', `${vx} ${vy} ${vw} ${vh}`);
+      tempSvg.setAttribute('preserveAspectRatio', 'none');
+      tempSvg.style.display = 'block';
+      tempSvg.style.position = 'absolute';
+      tempSvg.style.left = '0';
+      tempSvg.style.top = '0';
+      tempSvg.style.overflow = 'visible';
+      measure.appendChild(tempSvg);
+
+      // eslint-disable-next-line no-unused-expressions
+      tempSvg.getBoundingClientRect();
+
+      const svgRect = tempSvg.getBoundingClientRect();
+
+      if (!svgRect || svgRect.width <= 0 || svgRect.height <= 0) {
+        measure.removeChild(tempSvg);
+        sanitizedSvg.setAttribute('width', '100%');
+        sanitizedSvg.setAttribute('height', '100%');
+        sanitizedSvg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+        container.appendChild(sanitizedSvg);
+        return;
+      }
+
+      const pxPerUnitX = svgRect.width / vw;
+      const pxPerUnitY = svgRect.height / vh;
+
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      let found = false;
+
+      const gfxSelector =
+        'path, rect, circle, ellipse, line, polyline, polygon, text, image, use';
+
+      tempSvg.querySelectorAll(gfxSelector).forEach((el) => {
+        if (el.getAttribute('display') === 'none') return;
+        if (el.getAttribute('visibility') === 'hidden') return;
+        try {
+          const cs = window.getComputedStyle(el);
+          if (cs.display === 'none' || cs.visibility === 'hidden') return;
+          if (parseFloat(cs.opacity) === 0) return;
+        } catch (_) { /* ignore */ }
+
+        let r;
+        try {
+          r = el.getBoundingClientRect();
+        } catch (_) {
+          return;
+        }
+        if (!r || (r.width === 0 && r.height === 0)) return;
+
+        found = true;
+        const x1 = vx + (r.left - svgRect.left) / pxPerUnitX;
+        const y1 = vy + (r.top  - svgRect.top)  / pxPerUnitY;
+        const x2 = vx + (r.right  - svgRect.left) / pxPerUnitX;
+        const y2 = vy + (r.bottom - svgRect.top)  / pxPerUnitY;
+
+        minX = Math.min(minX, x1);
+        minY = Math.min(minY, y1);
+        maxX = Math.max(maxX, x2);
+        maxY = Math.max(maxY, y2);
+      });
+
+      measure.removeChild(tempSvg);
+
+      if (found && isFinite(minX) && isFinite(maxX) && maxX > minX && maxY > minY) {
+        const padX = (maxX - minX) * 0.005;
+        const padY = (maxY - minY) * 0.005;
+        const newVb =
+          `${minX - padX} ${minY - padY} ` +
+          `${maxX - minX + padX * 2} ${maxY - minY + padY * 2}`;
+        sanitizedSvg.setAttribute('viewBox', newVb);
+      }
+
+      sanitizedSvg.setAttribute('width', '100%');
+      sanitizedSvg.setAttribute('height', '100%');
+      sanitizedSvg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+
+      const scopeId = uniqueId || `svg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      sanitizedSvg.querySelectorAll('style').forEach((style) => {
+        style.textContent = rewriteStyleContent(style.textContent || '', scopeId);
+      });
+      sanitizedSvg.querySelectorAll('[class]').forEach((el) => {
+        const oldClass = el.getAttribute('class');
+        if (oldClass) el.setAttribute('class', rewriteClassAttribute(oldClass, scopeId));
+      });
+
+      container.appendChild(sanitizedSvg);
+    } catch (error) {
+      console.error('Error rendering SVG:', error);
+      container.replaceChildren();
+    } finally {
+      measure.remove();
+    }
+  };
+
+  const normalizeCard = (rawCard) => {
+    const c = rawCard || {};
+    const fontColors = normalizeFontColors(c);
+    return {
+      word: c.word || "",
+      transcription: c.transcription || "",
+      translation: c.translation || "",
+      svgCode: c.svgCode || "",
+      fontColors,
+    };
+  };
+
+  const applyDatabasePayload = useCallback((importedData, sourceName) => {
+    let records = [];
+    if (importedData.records && Array.isArray(importedData.records)) records = importedData.records;
+    else if (Array.isArray(importedData)) records = importedData;
+    else throw new Error("Invalid database file format");
+    if (records.length === 0) throw new Error("Database file contains no records");
+
+    const convertedRecords = records.map((record, idx) => {
+      if (record.card1 && record.card2) {
+        return {
+          id: record.id || idx + 1,
+          singular: normalizeCard(record.card1),
+          plural: normalizeCard(record.card2),
+        };
+      }
+      if (record.singular && record.plural) {
+        return {
+          id: record.id || idx + 1,
+          singular: normalizeCard(record.singular),
+          plural: normalizeCard(record.plural),
+        };
+      }
+      const single = normalizeCard(record);
+      return {
+        id: record.id || idx + 1,
+        singular: { ...single },
+        plural: { ...single },
+      };
+    });
+    setAllRecords(convertedRecords);
+    setCurrentIndex(0);
+    setCurrentRecord(convertedRecords[0]);
+    setActiveCard('singular');
+    setDbLoaded(true);
+
+    const cleanSourceName = String(sourceName || '')
+      .replace(/\.(json|dbms)$/i, '')
+      .trim();
+    setDbFileName(cleanSourceName || importedData.name || '');
+
+    setCardPulsing('singular', false);
+    setCardPulsing('plural', false);
+    setManualPulseCard(null);
+
+    failedCardsRef.current = [];
+
+    // ★ a fresh lesson load always means standby
+    setIsSpeaking(false);
+    setIsListeningForRepeat(false);
+  }, []);
+
+  const loadDatabaseFromFile = useCallback(async () => {
+    if (isStudying) stopStudyTimer();
+    if (navRepeatActiveRef.current) cancelRepeatCycle();
+    cancelAllSpeech();
+    stopRepeatListening();
+
+    const fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.accept = '.json,.dbms';
+    fileInput.onchange = async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      setIsLoading(true);
+      try {
+        const contents = await file.text();
+        const importedData = JSON.parse(contents);
+        applyDatabasePayload(importedData, file.name.replace(/\.(json|dbms)$/, ''));
+        notify(`✅ Database loaded successfully!\n\nFile: ${file.name}`);
+      } catch (error) {
+        alert(`❌ Failed to load database\n\nError: ${error.message}`);
+        setDbLoaded(false);
+        setCurrentRecord(null);
+        setAllRecords([]);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+    fileInput.click();
+  }, [applyDatabasePayload, stopStudyTimer, cancelRepeatCycle, cancelAllSpeech, stopRepeatListening]);
+
+  const loadDatabaseFromServer = useCallback(async (fileOverride = null) => {
+    const indexUrl = LESSONS_INDEX_URL;
+    const file = (fileOverride || settingsRef.current.selectedLessonFile || '').trim();
+
+    if (!file) {
+      alert('⚠️ No lesson selected.\n\nPlease pick a lesson from the list, or enable "Load lesson locally" to pick a file from your device.');
+      throw new Error('No lesson selected');
+    }
+
+    const baseDir = indexUrl.replace(/[^/]*$/, '');
+    const lessonUrl = baseDir + file;
+
+    if (isStudying) stopStudyTimer();
+    if (navRepeatActiveRef.current) cancelRepeatCycle();
+    cancelAllSpeech();
+    stopRepeatListening();
+
+    setIsLoading(true);
+    try {
+      const response = await fetch(lessonUrl, {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+      });
+      if (!response.ok) {
+        throw new Error(`Server returned ${response.status} ${response.statusText}`);
+      }
+      const text = await response.text();
+      const importedData = JSON.parse(text);
+      const sourceName = file.replace(/\.(json|dbms)$/, '') || 'lesson';
+      applyDatabasePayload(importedData, sourceName);
+
+      setSettings((prev) => ({ ...prev, selectedLessonFile: file }));
+      setIsLessonPickerOpen(false);
+    } catch (err) {
+      alert(`❌ Failed to load lesson\n\n${err.message}`);
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  }, [applyDatabasePayload, stopStudyTimer, cancelRepeatCycle, cancelAllSpeech, stopRepeatListening]);
+
+  const loadDatabase = useCallback(() => {
+    if (!initialLoadResolvedRef.current) return;
+
+    if (settingsRef.current.loadLessonLocally) {
+      loadDatabaseFromFile();
+    } else {
+      setIsLessonPickerOpen(true);
+    }
+  }, [loadDatabaseFromFile]);
+
+  const handlePickLesson = useCallback((file) => {
+    if (!file) return;
+    setIsLessonPickerOpen(false);
+    loadDatabaseFromServer(file).catch(() => { /* alert already shown */ });
+  }, [loadDatabaseFromServer]);
+
+  const nextRecord = () => {
+    if (allRecords.length > 0 && currentIndex < allRecords.length - 1 && !isStudying) {
+      if (navRepeatActiveRef.current) cancelRepeatCycle();
+      cancelAllSpeech(); clearManualPulse();
+      const newIndex = currentIndex + 1;
+      setCurrentIndex(newIndex); setCurrentRecord(allRecords[newIndex]); setActiveCard('singular');
+      // ★ ensure standby flags are clean
+      setIsSpeaking(false);
+      setIsListeningForRepeat(false);
+    }
+  };
+  const prevRecord = () => {
+    if (allRecords.length > 0 && currentIndex > 0 && !isStudying) {
+      if (navRepeatActiveRef.current) cancelRepeatCycle();
+      cancelAllSpeech(); clearManualPulse();
+      const newIndex = currentIndex - 1;
+      setCurrentIndex(newIndex); setCurrentRecord(allRecords[newIndex]); setActiveCard('singular');
+      // ★ ensure standby flags are clean
+      setIsSpeaking(false);
+      setIsListeningForRepeat(false);
+    }
+  };
+
+  const handleCardClick = (cardType) => {
+    if (isStudying) return;
+    if (!dbLoaded || !currentRecord) return;
+    if (!voiceSupport) return;
+
+    let word = '';
+    let translation = '';
+    if (cardType === 'singular') {
+      word = currentRecord.singular?.word || '';
+      translation = currentRecord.singular?.translation || '';
+    } else {
+      word = currentRecord.plural?.word || '';
+      translation = currentRecord.plural?.translation || '';
+    }
+
+    const hasWord = !!word && word.trim() !== '';
+    const hasTranslation =
+      !!translation && translation.trim() !== '' && settings.pronounceTranslation;
+
+    if (!hasWord && !hasTranslation) return;
+
+    if (settings.repeatAfterMe) {
+      if (!hasWord) {
+        if (navRepeatActiveRef.current) {
+          cancelRepeatCycle();
+        }
+
+        if (manualPulseCard === cardType) {
+          cancelAllSpeech();
+          setCardPulsing(cardType, false);
+          setManualPulseCard(null);
+          return;
+        }
+
+        if (hasTranslation) {
+          clearManualPulse();
+          setCardPulsing(cardType, true);
+          setManualPulseCard(cardType);
+
+          speakTranslationSmart(translation, () => {
+            setCardPulsing(cardType, false);
+            setManualPulseCard(null);
+          });
+        }
+        return;
+      }
+
+      if (navRepeatActiveRef.current && navRepeatCardTypeRef.current === cardType) {
+        cancelRepeatCycle();
+        setCardPulsing(cardType, false);
+        setManualPulseCard(null);
+        return;
+      }
+      startNavRepeatCycleRef.current?.(cardType, word);
+      return;
+    }
+
+    if (manualPulseCard === cardType) {
+      cancelAllSpeech();
+      setCardPulsing(cardType, false);
+      setManualPulseCard(null);
+      return;
+    }
+
+    if (!hasWord) {
+      clearManualPulse();
+      setCardPulsing(cardType, true);
+      setManualPulseCard(cardType);
+      const finishPronunciation = () => clearManualPulse();
+
+      speakTranslationSmart(translation, finishPronunciation);
+      return;
+    }
+
+    const currentVoice = getCurrentVoice();
+    if (!currentVoice) return;
+
+    clearManualPulse();
+
+    setCardPulsing(cardType, true);
+    setManualPulseCard(cardType);
+    const finishPronunciation = () => clearManualPulse();
+
+    if (settings.pronounceTranslation && hasTranslation) {
+      speakText(word, () => {
+        speakTranslationSmart(translation, finishPronunciation);
+      });
+    } else {
+      speakText(word, finishPronunciation);
+    }
+  };
+
+  const handleCardKeyDown = (cardType) => (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      handleCardClick(cardType);
+    }
+  };
+
+  const startButtonLabel = () => {
+    if (isStudying) return '⏹️ Stop';
+    if (settings.repeatAfterMe) return '🎧🎤 Repeat';
+    return '🎧 Start';
+  };
+  const startButtonAriaLabel = () => {
+    if (isStudying) return 'Stop study session';
+    if (settings.repeatAfterMe) return 'Start repeat-after-me study session';
+    return 'Start study session';
+  };
+
+  const appClassName = [
+    'app',
+    !settings.showTranscription ? 'hide-transcription' : '',
+    !settings.showTranslation ? 'hide-translation' : '',
+    settings.invisibleTopBar ? 'invisible-top-bar' : '',
+  ].filter(Boolean).join(' ');
+
+  const viewportW = displayInfo
+    ? (displayInfo.viewportClientWidth || displayInfo.viewportCssWidth || 0)
+    : 0;
+  const viewportH = displayInfo
+    ? (displayInfo.viewportClientHeight || displayInfo.viewportCssHeight || 0)
+    : 0;
+
+  const isLandscape =
+    displayInfo &&
+    displayInfo.viewportClientWidth > displayInfo.viewportClientHeight;
+
+  const fallbackTopBarHeight = isLandscape
+    ? TOP_BAR_HEIGHT_LANDSCAPE
+    : TOP_BAR_HEIGHT_PORTRAIT;
+  const effectiveTopBarHeight =
+    (measuredTopBarHeight && measuredTopBarHeight > 0)
+      ? measuredTopBarHeight
+      : fallbackTopBarHeight;
+
+  const autoGap = Math.max(
+    5,
+    Math.min(100, Number(settings.cardGap) || 10)
+  );
+
+  let effectiveTopPanelWidth = settings.topPanelWidth;
+  let effectiveCardWidth = settings.cardWidth;
+  let effectiveCardHeight = settings.cardHeight;
+  let effectiveGap = settings.cardGap;
+  let sideInset = 0;
+  let topGap = 0;
+  let bottomGap = 0;
+
+  if (settings.autoAlign && viewportW > 0) {
+    effectiveGap = autoGap;
+    topGap = TOP_BAR_GAP_PX;
+    bottomGap = autoGap;
+    sideInset = autoGap;
+
+    if (isLandscape) {
+      const rowWidth = viewportW - sideInset * 2;
+      effectiveTopPanelWidth = Math.max(300, rowWidth);
+
+      const wFromRow = Math.floor((rowWidth - effectiveGap) / 2);
+      effectiveCardWidth = Math.max(MIN_CARD_WIDTH, wFromRow);
+
+      const hAvail =
+        viewportH - effectiveTopBarHeight - topGap - bottomGap;
+      effectiveCardHeight = Math.max(MIN_CARD_HEIGHT, Math.floor(hAvail));
+    } else {
+      const rowWidth = viewportW - sideInset * 2;
+      effectiveTopPanelWidth = Math.max(300, rowWidth);
+
+      effectiveCardWidth = Math.min(
+        MAX_AUTO_CARD_WIDTH,
+        Math.max(MIN_CARD_WIDTH, rowWidth)
+      );
+
+      const hAvail =
+        viewportH
+        - effectiveTopBarHeight
+        - topGap        - effectiveGap
+        - bottomGap;
+      const hPerCard = Math.floor(hAvail / 2);
+      effectiveCardHeight = Math.max(MIN_CARD_HEIGHT, hPerCard);
+    }
+  }
+
+  const appStyle = {
+    '--top-panel-width':     `${effectiveTopPanelWidth}px`,
+    '--card-width':          `${effectiveCardWidth}px`,
+    '--card-height':         `${effectiveCardHeight}px`,
+    '--card-gap':            `${effectiveGap}px`,
+    '--font-size':           `${settings.fontSize}px`,
+    '--viewport-width':      viewportW ? `${viewportW}px` : '100vw',
+    '--viewport-height':     viewportH ? `${viewportH}px` : '100vh',
+    '--landscape-inset':     `${sideInset}px`,
+    '--landscape-bottom':    `${bottomGap}px`,
+    '--landscape-top-gap':   `${topGap}px`,
+    '--measured-top-bar-height': `${effectiveTopBarHeight}px`,
+  };
+
+  const svgWrapperClass = settings.showSvgBorder ? 'svg-wrapper svg-bordered' : 'svg-wrapper';
+
+  const singularSvgCode = currentRecord?.singular?.svgCode || '';
+  const pluralSvgCode = currentRecord?.plural?.svgCode || '';
+
+  useLayoutEffect(() => {
+    if (!dbLoaded) {
+      if (singularSvgRef.current) singularSvgRef.current.replaceChildren();
+      if (pluralSvgRef.current) pluralSvgRef.current.replaceChildren();
+      return;
+    }
+
+    renderSvgToContainer(singularSvgRef.current, singularSvgCode, 'singular');
+    renderSvgToContainer(pluralSvgRef.current, pluralSvgCode, 'plural');
+
+    const MIN_SVG_H = 60;
+    const CONTENT_GAP = 8;
+
+    const sizeOne = (contentEl, transcriptionEl, translationEl, svgWrapperEl) => {
+      if (!contentEl || !svgWrapperEl) return;
+
+      svgWrapperEl.style.height = '';
+      svgWrapperEl.style.flex = '';
+      if (translationEl) {
+        translationEl.style.height = '';
+        translationEl.style.maxHeight = '';
+        translationEl.style.flex = '';
+      }
+
+      let translationNaturalH = 0;
+      if (translationEl) {
+        const prevMaxHeight = translationEl.style.maxHeight;
+        const prevOverflow = translationEl.style.overflow;
+        translationEl.style.maxHeight = 'none';
+        translationEl.style.overflow = 'visible';
+        translationNaturalH = translationEl.offsetHeight;
+        translationEl.style.maxHeight = prevMaxHeight;
+        translationEl.style.overflow = prevOverflow;
+      }
+
+      const contentH = contentEl.clientHeight;
+      const transcriptionH = transcriptionEl ? transcriptionEl.offsetHeight : 0;
+
+      const gaps =
+        (transcriptionEl ? CONTENT_GAP : 0) +
+        (translationEl && translationNaturalH > 0 ? CONTENT_GAP : 0);
+
+      const available = contentH - transcriptionH - gaps;
+      const maxTranslationH = Math.max(0, available - MIN_SVG_H);
+      const translationH = Math.min(translationNaturalH, maxTranslationH);
+
+      if (translationEl) {
+        translationEl.style.flex = '0 0 auto';
+        translationEl.style.height = `${translationH}px`;
+        translationEl.style.maxHeight = `${translationH}px`;
+        translationEl.style.overflow = 'hidden';
+      }
+
+      const svgH = Math.max(MIN_SVG_H, available - translationH);
+      svgWrapperEl.style.flex = '0 0 auto';
+      svgWrapperEl.style.height = `${svgH}px`;
+    };
+
+    const run = () => {
+      if (!dbLoaded || !currentRecord) return;
+      sizeOne(
+        singularContentRef.current,
+        singularTranscriptionRef.current,
+        singularTranslationRef.current,
+        singularSvgRef.current,
+      );
+      sizeOne(
+        pluralContentRef.current,
+        pluralTranscriptionRef.current,
+        pluralTranslationRef.current,
+        pluralSvgRef.current,
+      );
+    };
+
+    run();
+
+    const raf1 = requestAnimationFrame(run);
+    const raf2 = requestAnimationFrame(() => requestAnimationFrame(run));
+
+    let ro = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(() => { run(); });
+      if (singularContentRef.current) ro.observe(singularContentRef.current);
+      if (pluralContentRef.current) ro.observe(pluralContentRef.current);
+    }
+
+    window.addEventListener('resize', run);
+    window.addEventListener('orientationchange', run);
+
+    return () => {
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
+      window.removeEventListener('resize', run);
+      window.removeEventListener('orientationchange', run);
+      if (ro) ro.disconnect();
+    };
+  }, [
+    dbLoaded,
+    currentRecord,
+    singularSvgCode,
+    pluralSvgCode,
+    settings.autoAlign,
+    settings.fontSize,
+    settings.showTranscription,
+    settings.showTranslation,
+    effectiveCardHeight,
+    effectiveCardWidth,
+    isLandscape,
+  ]);
+
+  const showRepeatChip =
+    (settings.repeatAfterMe && isStudying) ||
+    (settings.repeatAfterMe && navRepeatActive);
+
+  const repeatSessionActive =
+    (settings.repeatAfterMe && isStudying) ||
+    (settings.repeatAfterMe && navRepeatActive);
+
+  const pillSpeakingOnly =
+    isSpeaking &&
+    !isStudying &&
+    !navRepeatActive &&
+    !showRepeatChip;
+
+  // Standby = nothing is happening (title should attract attention)
+  const isStandby =
+    dbLoaded &&
+    allRecords.length > 0 &&
+    !isStudying &&
+    !navRepeatActive &&
+    !isSpeaking &&
+    !isListeningForRepeat &&
+    !manualPulseCard;
+
+  const singularFontColors = currentRecord?.singular?.fontColors || {};
+  const pluralFontColors   = currentRecord?.plural?.fontColors   || {};
+
+  return (
+    <div
+      className={appClassName}
+      style={appStyle}
+      data-orientation={isLandscape ? 'landscape' : 'portrait'}
+      data-auto-align={settings.autoAlign ? 'on' : 'off'}
+    >
+      <div className="top-bar-wrapper">
+        <div className="top-bar" role="banner" ref={topBarRef}>
+          <div className="header-left">
+            <button
+              onClick={toggleTheme}
+              className="nav-button theme-button"
+              style={{ background: '#ff9800', padding: '6px 12px' }}
+              aria-label={settings.theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+              title={settings.theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+            >
+              <span aria-hidden="true">{settings.theme === 'dark' ? '☀️' : '🌙'}</span>
+            </button>
+
+            <button
+              type="button"
+              className={
+                'header-title header-title-button' +
+                (isStandby
+                  ? ` attention attention-${attentionVariant}`
+                  : '')
+              }
+              onClick={() => setIsCreditOpen(true)}
+              aria-label="About Eco Cards"
+              title="About Eco Cards"
+            >
+              Eco Cards
+            </button>
+
+            {!isStudying && (
+              <button
+                className="menu-button"
+                onClick={openSettings}
+                aria-label="Open settings"
+                title="Settings"
+              >
+                <span aria-hidden="true">🔧</span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              className={`header-db-info header-db-info-button ${showRepeatChip ? `repeat-mode repeat-${repeatStatus || 'idle'}` : ''}`}
+              onClick={loadDatabase}
+              disabled={
+                isLoading ||
+                isStudying ||
+                navRepeatActive ||
+                isSpeaking ||
+                (!initialLoadResolved && !settings.loadLessonLocally)
+              }
+              aria-live="polite"
+              aria-atomic="true"
+              aria-label={
+                isLoading
+                  ? 'Loading lesson'
+                  : settings.loadLessonLocally
+                    ? 'Load lesson from local files'
+                    : 'Load lesson from server'
+              }
+              title={
+                isLoading
+                  ? 'Loading lesson'
+                  : settings.loadLessonLocally
+                    ? 'Load lesson locally'
+                    : 'Load lesson from server'
+              }
+            >
+              <span
+                className="db-info-label"
+                aria-hidden="true"
+                style={pillSpeakingOnly ? { display: 'none' } : undefined}
+              >
+                {settings.loadLessonLocally ? '📁' : '🌐'}
+              </span>
+
+              {pillSpeakingOnly ? (
+                <span
+                  className="db-info-timer"
+                  role="status"
+                  aria-live="polite"
+                  aria-label="Currently speaking"
+                  title="Speaking"
+                >
+                  <span aria-hidden="true">🎧</span>
+                </span>
+              ) : dbLoaded && currentRecord && !repeatSessionActive ? (
+                <>
+                  <span className="db-info-name">{dbFileName}</span>
+                  <span className="db-info-separator" aria-hidden="true">|</span>
+                  <span className="db-info-id">ID: {currentRecord.id} / {allRecords.length}</span>
+
+                  {isSpeaking && (
+                    <>
+                      <span className="db-info-separator" aria-hidden="true">|</span>
+                      <span className="db-info-timer" role="status" aria-live="polite"
+                        aria-label="Currently speaking" title="Speaking">
+                        <span aria-hidden="true">🎧</span>
+                      </span>
+                    </>
+                  )}
+
+                  {settings.repeatAfterMe &&
+                    isStudying &&
+                    isListeningForRepeat &&
+                    !showRepeatChip && (
+                    <>
+                      <span className="db-info-separator" aria-hidden="true">|</span>
+                      <span className="db-info-timer" role="status" aria-live="polite"
+                        aria-label="Listening for your voice" title="Listening">
+                        <span aria-hidden="true">🎤</span>
+                      </span>
+                    </>
+                  )}
+
+                  {showRepeatChip && (
+                    <>
+                      <span className="db-info-separator" aria-hidden="true">|</span>
+                      <span className="db-info-repeat" aria-live="polite">
+                        {repeatStatus === 'listening' && (<><span aria-hidden="true">🎤</span><span>Listening ({repeatProgress.current}/{repeatProgress.total})…</span></>)}
+                        {repeatStatus === 'matched' && (<><span aria-hidden="true">✅</span><span>Matched ({repeatProgress.current}/{repeatProgress.total})</span></>)}
+                        {repeatStatus === 'retry' && (<><span aria-hidden="true">🔁</span><span>Retry ({repeatProgress.current}/{repeatProgress.total})</span></>)}
+                        {repeatStatus === 'error' && (<><span aria-hidden="true">⚠️</span><span>Speech error</span></>)}
+                        {!repeatStatus && (<><span aria-hidden="true">🎧</span><span>Repeat After Me</span></>)}
+                      </span>
+
+                      {lastRecognized && (
+                        <span
+                          className={`recognized-chip recognized-${repeatStatus || 'idle'}`}
+                          role="status"
+                          aria-live="polite"
+                          aria-atomic="true"
+                          title="Recognized word"
+                        >
+                          {lastRecognized}
+                        </span>
+                      )}
+                    </>
+                  )}
+                </>
+              ) : repeatSessionActive ? (
+                <>
+                  {showRepeatChip && (
+                    <>
+                      <span className="db-info-repeat" aria-live="polite">
+                        {repeatStatus === 'listening' && (<><span aria-hidden="true">🎤</span><span>Listening ({repeatProgress.current}/{repeatProgress.total})…</span></>)}
+                        {repeatStatus === 'matched' && (<><span aria-hidden="true">✅</span><span>Matched ({repeatProgress.current}/{repeatProgress.total})</span></>)}
+                        {repeatStatus === 'retry' && (<><span aria-hidden="true">🔁</span><span>Retry ({repeatProgress.current}/{repeatProgress.total})</span></>)}
+                        {repeatStatus === 'error' && (<><span aria-hidden="true">⚠️</span><span>Speech error</span></>)}
+                        {!repeatStatus && (<><span aria-hidden="true">🎧</span><span>Repeat After Me</span></>)}
+                      </span>
+
+                      {lastRecognized && (
+                        <span
+                          className={`recognized-chip recognized-${repeatStatus || 'idle'}`}
+                          role="status"
+                          aria-live="polite"
+                          aria-atomic="true"
+                          title="Recognized word"
+                        >
+                          {lastRecognized}
+                        </span>
+                      )}
+                    </>
+                  )}
+                </>
+              ) : (
+                isLoading ? (
+                  <span className="db-info-name">Loading…</span>
+                ) : null
+              )}
+            </button>
+          </div>
+
+          <div className="header-buttons">
+            {dbLoaded && allRecords.length > 0 && (
+              <>
+                <button
+                  onClick={prevRecord}
+                  className={`nav-button ${isStudying ? 'hidden-but-reserved' : ''}`}
+                  style={{ background: '#0078d4', padding: '6px 12px' }}
+                  disabled={isStudying}
+                  aria-label="Previous card" title="Previous card"
+                >
+                  <span aria-hidden="true">◀</span>
+                </button>
+                <button
+                  onClick={nextRecord}
+                  className={`nav-button ${isStudying ? 'hidden-but-reserved' : ''}`}
+                  style={{ background: '#0078d4', padding: '6px 12px' }}
+                  disabled={isStudying}
+                  aria-label="Next card" title="Next card"
+                >
+                  <span aria-hidden="true">▶</span>
+                </button>
+              </>
+            )}
+
+            {dbLoaded && allRecords.length > 0 && (
+              <button
+                className={isStudying ? "stop-button" : "start-button"}
+                onClick={handleMainAction}
+                disabled={isLoading}
+                aria-label={startButtonAriaLabel()}
+                title={startButtonAriaLabel()}
+              >
+                {startButtonLabel()}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="page-content">
+        <div className="cards-row" role="group" aria-label="Word cards">
+          <div
+            ref={singularCardRef}
+            className="card"
+            onClick={() => handleCardClick('singular')}
+            onKeyDown={handleCardKeyDown('singular')}
+            role="button"
+            tabIndex={dbLoaded && !isStudying ? 0 : -1}
+            aria-label={
+              dbLoaded && currentRecord?.singular?.word
+                ? `Pronounce singular word: ${currentRecord.singular.word}`
+                : 'Singular word card'
+            }
+            aria-disabled={isStudying}
+          >
+            <div className="english-word">
+              {dbLoaded && currentRecord?.singular?.word ? (
+                <ColoredText
+                  text={currentRecord.singular.word}
+                  colors={singularFontColors.word}
+                />
+              ) : null}
+            </div>
+            <div className="card-content" ref={singularContentRef}>
+              <div className="transcription" ref={singularTranscriptionRef}>
+                {dbLoaded && currentRecord?.singular?.transcription ? (
+                  <ColoredText
+                    text={currentRecord.singular.transcription}
+                    colors={singularFontColors.transcription}
+                  />
+                ) : null}
+              </div>
+              <div className={svgWrapperClass} ref={singularSvgRef} aria-hidden="true"></div>
+              <div className="translation" ref={singularTranslationRef}>
+                {dbLoaded && currentRecord?.singular?.translation ? (
+                  <ColoredText
+                    text={currentRecord.singular.translation}
+                    colors={singularFontColors.translation}
+                  />
+                ) : null}
+              </div>
+            </div>
+          </div>
+
+          <div
+            ref={pluralCardRef}
+            className="card"
+            onClick={() => handleCardClick('plural')}
+            onKeyDown={handleCardKeyDown('plural')}
+            role="button"
+            tabIndex={dbLoaded && !isStudying ? 0 : -1}
+            aria-label={
+              dbLoaded && currentRecord?.plural?.word
+                ? `Pronounce plural word: ${currentRecord.plural.word}`
+                : 'Plural word card'
+            }
+            aria-disabled={isStudying}
+          >
+            <div className="english-word">
+              {dbLoaded && currentRecord?.plural?.word ? (
+                <ColoredText
+                  text={currentRecord.plural.word}
+                  colors={pluralFontColors.word}
+                />
+              ) : null}
+            </div>
+            <div className="card-content" ref={pluralContentRef}>
+              <div className="transcription" ref={pluralTranscriptionRef}>
+                {dbLoaded && currentRecord?.plural?.transcription ? (
+                  <ColoredText
+                    text={currentRecord.plural.transcription}
+                    colors={pluralFontColors.transcription}
+                  />
+                ) : null}
+              </div>
+              <div className={svgWrapperClass} ref={pluralSvgRef} aria-hidden="true"></div>
+              <div className="translation" ref={pluralTranslationRef}>
+                {dbLoaded && currentRecord?.plural?.translation ? (
+                  <ColoredText
+                    text={currentRecord.plural.translation}
+                    colors={pluralFontColors.translation}
+                  />
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {isSettingsOpen && (
+        <div className="settings-overlay" onClick={closeSettings} role="presentation">
+          <div
+            className="settings-modal"
+            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="settings-title"
+          >
+            <div className="settings-header">
+              <h2 id="settings-title">🔧 Settings</h2>
+              <button className="settings-close" onClick={closeSettings} aria-label="Close settings" title="Close settings">
+                <span aria-hidden="true">×</span>
+              </button>
+            </div>
+            <div className="settings-content">
+              <div className="settings-section">
+                <h3>Study Settings</h3>
+                <div className="setting-item checkbox">
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={settings.repeatAfterMe}
+                      onChange={(e) => handleRepeatAfterMeToggle(e.target.checked)}
+                    />
+                    🎤 Repeat after me
+                  </label>
+                </div>
+
+                {settings.repeatAfterMe && (
+                  <div className="setting-item">
+                    <label htmlFor="setting-repeatAfterMeTimes">Attempt:</label>
+                    <input
+                      id="setting-repeatAfterMeTimes"
+                      type="number"
+                      value={settings.repeatTimes}
+                      onChange={(e) => handleSettingChange('repeatTimes', parseInt(e.target.value) || 3)}
+                      min="1" max="5" step="1"
+                      style={{
+                        background: '#3c3c3c',
+                        border: '1px solid #555',
+                        color: 'white',
+                        padding: '0.4rem 0.6rem',
+                        borderRadius: '6px',
+                        fontSize: '0.9rem',
+                        width: '80px'
+                      }}
+                    />
+                    <span style={{ marginLeft: '0.5rem', fontSize: '0.8rem', color: '#aaa' }}>times</span>
+                  </div>
+                )}
+
+                {settings.repeatAfterMe && !browserSupportsSpeechRecognition && (
+                  <div className="setting-item">
+                    <small style={{ color: '#f44336', fontSize: '0.8rem' }}>
+                      ⚠️ Your browser doesn't support speech recognition. This mode won't work.
+                    </small>
+                  </div>
+                )}
+
+                {settings.repeatAfterMe && browserSupportsSpeechRecognition && (
+                  <div className="setting-item">
+                    <small style={{ color: '#4caf50', fontSize: '0.75rem' }}>
+                      ✓ The word is pronounced {settings.repeatTimes} time(s). After each pronunciation the mic listens once. Each attempt must match before moving on.
+                    </small>
+                  </div>
+                )}
+
+                {settings.repeatAfterMe && browserSupportsSpeechRecognition && (
+                  <div className="setting-item checkbox">
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={settings.repeatOnWordsNotEqual}
+                        onChange={(e) => handleSettingChange('repeatOnWordsNotEqual', e.target.checked)}
+                      />
+                      Repeat pronunciation if words not equal
+                    </label>
+                  </div>
+                )}
+
+                <div className="setting-item checkbox">
+                  <label>
+                    <input type="checkbox" checked={settings.randomOrder}
+                      onChange={(e) => handleSettingChange('randomOrder', e.target.checked)} />
+                    Random pair of cards study (shuffle all records)
+                  </label>
+                </div>
+
+                <div className="setting-item">
+                  <label htmlFor="setting-studyTime">Study Time per Card (seconds):</label>
+                  <input id="setting-studyTime" type="number" value={settings.studyTime}
+                    onChange={(e) => handleSettingChange('studyTime', parseInt(e.target.value) || 10)}
+                    min="3" max="60" step="1" />
+                </div>
+                <div className="setting-item checkbox">
+                  <label>
+                    <input type="checkbox" checked={settings.autoPronounce}
+                      onChange={(e) => handleSettingChange('autoPronounce', e.target.checked)} />
+                    Auto-pronounce words during study
+                  </label>
+                </div>
+              </div>
+
+              <div className="settings-section">
+                <div className="setting-item checkbox">
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={settings.hideOptionsBelow}
+                      onChange={(e) => handleSettingChange('hideOptionsBelow', e.target.checked)}
+                    />
+                    Hide options below
+                  </label>
+                </div>
+              </div>
+
+              {!settings.hideOptionsBelow && (
+                <>
+                  <div className="settings-section">
+                    <h3>Voice Settings</h3>
+                    <div className="setting-item">
+                      <label htmlFor="setting-voice">Select Voice:</label>
+                      <select id="setting-voice" value={settings.selectedVoiceName}
+                        onChange={(e) => handleVoiceChange(e.target.value)}
+                        disabled={!voicesLoaded}
+                        style={{ background: '#3c3c3c', border: '1px solid #555', color: 'white', padding: '0.4rem 0.6rem', borderRadius: '6px', fontSize: '0.9rem', width: '220px', cursor: voicesLoaded ? 'pointer' : 'not-allowed', opacity: voicesLoaded ? 1 : 0.6 }}>
+                        <option value="">-- Select a voice --</option>
+                        {availableVoices.map((voice) => (<option key={voice.name} value={voice.name}>{voice.name} ({voice.lang})</option>))}
+                      </select>
+                    </div>
+                    <div className="setting-item">
+                      <button onClick={loadVoices} disabled={isLoadingVoices} aria-busy={isLoadingVoices}
+                        aria-label={voicesLoaded ? 'Voices already loaded' : 'Load available voices'}
+                        style={{ background: '#0078d4', border: 'none', color: 'white', padding: '0.4rem 0.8rem', borderRadius: '6px', cursor: isLoadingVoices ? 'wait' : 'pointer', fontSize: '0.9rem', width: 'auto', marginLeft: '0.5rem' }}>
+                        {isLoadingVoices ? 'Loading...' : (voicesLoaded ? '✓ Voices Loaded' : '📢 Load Voices')}
+                      </button>
+                      {!voicesLoaded && (<span style={{ marginLeft: '0.5rem', fontSize: '0.7rem', color: '#ff9800' }}>⚠️ Required - Click to load</span>)}
+                    </div>
+                    <div className="setting-item">
+                      <label htmlFor="setting-repeatTimes">Repeat English words:</label>
+                      <input id="setting-repeatTimes" type="number" value={settings.repeatTimes}
+                        onChange={(e) => handleSettingChange('repeatTimes', parseInt(e.target.value) || 3)}
+                        min="1" max="5" step="1"
+                        style={{ background: '#3c3c3c', border: '1px solid #555', color: 'white', padding: '0.4rem 0.6rem', borderRadius: '6px', fontSize: '0.9rem', width: '80px' }} />
+                      <span style={{ marginLeft: '0.5rem', fontSize: '0.8rem', color: '#aaa' }}>times</span>
+                    </div>
+                    <div className="setting-item checkbox">
+                      <label>
+                        <input type="checkbox" checked={settings.pronounceTranslation}
+                          onChange={(e) => handleSettingChange('pronounceTranslation', e.target.checked)} />
+                        Pronounce translation
+                      </label>
+                    </div>
+                    <div className="setting-item">
+                      <label htmlFor="setting-translationVoice">Translation Voice:</label>
+                      <select id="setting-translationVoice" value={settings.translationVoiceName || ""}
+                        onChange={(e) => handleSettingChange('translationVoiceName', e.target.value)}
+                        disabled={!voicesLoaded || !settings.pronounceTranslation}
+                        style={{ background: '#3c3c3c', border: '1px solid #555', color: 'white', padding: '0.4rem 0.6rem', borderRadius: '6px', fontSize: '0.9rem', width: '220px', cursor: (voicesLoaded && settings.pronounceTranslation) ? 'pointer' : 'not-allowed', opacity: (voicesLoaded && settings.pronounceTranslation) ? 1 : 0.6 }}>
+                        <option value="">-- Select a voice --</option>
+                        {availableVoices.map((voice) => (<option key={voice.name} value={voice.name}>{voice.name} ({voice.lang})</option>))}
+                      </select>
+                    </div>
+                    <div className="setting-item">
+                      <label htmlFor="setting-translationRepeatTimes">Repeat translation Voice:</label>
+                      <input id="setting-translationRepeatTimes" type="number" value={settings.translationRepeatTimes}
+                        onChange={(e) => handleSettingChange('translationRepeatTimes', parseInt(e.target.value) || 1)}
+                        min="1" max="5" step="1"
+                        disabled={!settings.pronounceTranslation}
+                        style={{ background: settings.pronounceTranslation ? '#3c3c3c' : '#2a2a2a', border: '1px solid #555', color: 'white', padding: '0.4rem 0.6rem', borderRadius: '6px', fontSize: '0.9rem', width: '80px', cursor: settings.pronounceTranslation ? 'pointer' : 'not-allowed', opacity: settings.pronounceTranslation ? 1 : 0.6 }} />
+                      <span style={{ marginLeft: '0.5rem', fontSize: '0.8rem', color: '#aaa' }}>times</span>
+                    </div>
+                    <div className="setting-item">
+                      <small style={{ color: voicesLoaded ? '#4caf50' : '#ff9800', fontSize: '0.8rem', fontWeight: 'bold' }}>
+                        {voicesLoaded ? `✓ Current voice: ${settings.selectedVoiceName || "None selected"}` : '⚠️ Voices not loaded - Click "Load Voices" button'}
+                      </small>
+                    </div>
+                    {!voiceSupport && (<div className="setting-item"><small style={{ color: '#f44336', fontSize: '0.8rem' }}>⚠️ Voice support not available</small></div>)}
+                  </div>
+
+                  <div className="settings-section">
+                    <h3>Display Options</h3>
+                    <div className="setting-item checkbox">
+                      <label><input type="checkbox" checked={settings.showTranscription}
+                        onChange={(e) => handleSettingChange('showTranscription', e.target.checked)} /> Show Transcription</label>
+                    </div>
+                    <div className="setting-item checkbox">
+                      <label><input type="checkbox" checked={settings.showTranslation}
+                        onChange={(e) => handleSettingChange('showTranslation', e.target.checked)} /> Show Translation</label>
+                    </div>
+                    <div className="setting-item checkbox">
+                      <label><input type="checkbox" checked={settings.loadLessonLocally}
+                        onChange={(e) => handleSettingChange('loadLessonLocally', e.target.checked)} /> Load lesson locally</label>
+                    </div>
+                    <div className="setting-item checkbox">
+                      <label><input type="checkbox" checked={settings.invisibleTopBar}
+                        onChange={(e) => handleSettingChange('invisibleTopBar', e.target.checked)} /> Invisible Top bar</label>
+                    </div>
+
+                    {displayInfo && (
+                      <div
+                        className="setting-item"
+                        style={{
+                          display: 'block',
+                          fontFamily: 'monospace',
+                          fontSize: '0.78rem',
+                          lineHeight: 1.5,
+                          color: '#aaa',
+                          background: '#1f1f1f',
+                          border: '1px solid #3c3c3c',
+                          borderRadius: '8px',
+                          padding: '0.6rem 0.8rem',
+                          marginTop: '0.4rem',
+                        }}
+                      >
+                        <div><strong style={{ color: '#e0e0e0' }}>CSS px — layout viewport</strong></div>
+                        <div>
+                          {displayInfo.viewportCssWidth} × {displayInfo.viewportCssHeight} px
+                          {' '}(client: {displayInfo.viewportClientWidth} × {displayInfo.viewportClientHeight})
+                        </div>
+
+                        <div style={{ marginTop: '0.5rem' }}><strong style={{ color: '#e0e0e0' }}>Screen resolution</strong></div>
+                        <div>
+                          CSS: {displayInfo.screenCssWidth} × {displayInfo.screenCssHeight} px
+                        </div>
+                        <div>
+                          Physical: {displayInfo.screenDeviceWidth} × {displayInfo.screenDeviceHeight} px
+                          {' '}(DPR {displayInfo.devicePixelRatio})
+                        </div>
+
+                        <div style={{ marginTop: '0.5rem' }}><strong style={{ color: '#e0e0e0' }}>Screen orientation</strong></div>
+                        <div>
+                          {displayInfo.screenOrientationType || 'n/a'}
+                          {displayInfo.screenOrientationAngle != null ? ` · ${displayInfo.screenOrientationAngle}°` : ''}
+                        </div>
+
+                        <div style={{ marginTop: '0.5rem' }}><strong style={{ color: '#e0e0e0' }}>Effective layout</strong></div>
+                        <div>
+                          auto align: {settings.autoAlign ? 'ON' : 'OFF'}
+                          {' '}· orientation: {isLandscape ? 'landscape' : 'portrait'}
+                        </div>
+                        <div>
+                          top bar (measured): {Math.round(effectiveTopBarHeight)}px
+                          {' '}· top panel: {effectiveTopPanelWidth}px
+                        </div>
+                        <div>
+                          card: {effectiveCardWidth}×{effectiveCardHeight}px
+                          {' '}· gap between cards: {effectiveGap}px
+                        </div>
+                        {settings.autoAlign && (
+                          <div>
+                            gap top bar → cards: {topGap}px
+                            {' '}· gap cards → bottom: {bottomGap}px
+                            {' '}· side inset: {sideInset}px
+                          </div>
+                        )}
+                        <div style={{ marginTop: '0.5rem' }}>
+                          listening min: {LISTEN_MIN_MS} ms
+                          {' '}· silence window: {SILENCE_DEBOUNCE_MS} ms
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="settings-section">
+                    <h3>Alerts</h3>
+                    <div className="setting-item checkbox">
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={settings.hideAlerts}
+                          onChange={(e) => handleSettingChange('hideAlerts', e.target.checked)}
+                        />
+                        Hide alerts
+                      </label>
+                    </div>
+                    <div className="setting-item">
+                      <small style={{ color: '#aaa', fontSize: '0.7rem' }}>
+                        When checked, informational popups are suppressed. Session results and errors are still shown.
+                      </small>
+                    </div>
+                  </div>
+
+                  <div className="settings-section">
+                    <h3>Card Appearance</h3>
+                    <div className="setting-item checkbox">
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={settings.autoAlign}
+                          onChange={(e) => handleSettingChange('autoAlign', e.target.checked)}
+                        />
+                        Auto align elements
+                      </label>
+                    </div>
+
+                    <div className="setting-item">
+                      <label htmlFor="setting-cardGap">Gap between cards (px):</label>
+                      <input id="setting-cardGap" type="number" value={settings.cardGap}
+                        onChange={(e) => handleSettingChange('cardGap', parseInt(e.target.value) || 10)}
+                        min="5" max="100" step="5" />
+                    </div>
+
+                    {!settings.autoAlign && (
+                      <>
+                        <div className="setting-item">
+                          <label htmlFor="setting-topPanelWidth">Top panel width (px):</label>
+                          <input id="setting-topPanelWidth" type="number" value={settings.topPanelWidth}
+                            onChange={(e) => handleSettingChange('topPanelWidth', parseInt(e.target.value) || 916)}
+                            min="300" max="2000" step="10" />
+                        </div>
+                        <div className="setting-item">
+                          <label htmlFor="setting-cardWidth">Card Width (px):</label>
+                          <input id="setting-cardWidth" type="number" value={settings.cardWidth}
+                            onChange={(e) => handleSettingChange('cardWidth', parseInt(e.target.value) || 400)}
+                            min="150" max="800" step="10" />
+                        </div>
+                        <div className="setting-item">
+                          <label htmlFor="setting-cardHeight">Card Height (px):</label>
+                          <input id="setting-cardHeight" type="number" value={settings.cardHeight}
+                            onChange={(e) => handleSettingChange('cardHeight', parseInt(e.target.value) || 400)}
+                            min="150" max="800" step="10" />
+                        </div>
+                      </>
+                    )}
+
+                    <div className="setting-item">
+                      <label htmlFor="setting-fontSize">Font Size (px):</label>
+                      <input id="setting-fontSize" type="number" value={settings.fontSize}
+                        onChange={(e) => handleSettingChange('fontSize', parseInt(e.target.value) || 32)}
+                        min="8" max="48" step="2" />
+                    </div>
+                    <div className="setting-item checkbox">
+                      <label>
+                        <input type="checkbox" checked={settings.showSvgBorder}
+                          onChange={(e) => handleSettingChange('showSvgBorder', e.target.checked)} />
+                        Show SVG canvas border
+                      </label>
+                    </div>
+
+                    <div className="setting-item">
+                      <button
+                        type="button"
+                        className="stats-open-button"
+                        onClick={openStats}
+                        aria-label="Open statistics window"
+                      >
+                        📊 Statistics
+                      </button>
+                      <small style={{ color: '#aaa', fontSize: '0.7rem', display: 'block', marginTop: '0.3rem' }}>
+                        Mismatched words across all Repeat-After-Me sessions
+                      </small>
+                    </div>
+
+                    <div className="button-group margin-top">
+                      <button
+                        type="button"
+                        className="settings-open"
+                        onClick={handleOpenSettingsFile}
+                      >
+                        📂 Open Settings
+                      </button>
+                      <button
+                        type="button"
+                        className="settings-save"
+                        onClick={saveSettings}
+                      >
+                        Save Settings
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+            <div className="settings-footer">
+              <button className="settings-ok" onClick={applyAndClose}>Ok</button>
+              <button className="settings-cancel" onClick={closeSettings}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isLessonPickerOpen && (
+        <div
+          className="settings-overlay"
+          onClick={() => { if (!isLoading) setIsLessonPickerOpen(false); }}
+          role="presentation"
+        >
+          <div
+            className="settings-modal"
+            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="lesson-picker-title"
+          >
+            <div className="settings-header">
+              <h2 id="lesson-picker-title">📂 Choose a lesson</h2>
+              <button
+                className="settings-close"
+                onClick={() => { if (!isLoading) setIsLessonPickerOpen(false); }}
+                aria-label="Close lesson picker"
+                title="Close"
+                disabled={isLoading}
+              >
+                <span aria-hidden="true">×</span>
+              </button>
+            </div>
+
+            <div className="settings-content">
+              {isLoadingLessonsList && (
+                <div className="setting-item">
+                  <small style={{ color: '#aaa', fontSize: '0.9rem' }}>Loading lessons…</small>
+                </div>
+              )}
+
+              {!isLoadingLessonsList && lessonsListError && (
+                <div className="setting-item">
+                  <small style={{ color: '#f44336', fontSize: '0.85rem' }}>
+                    ⚠️ Could not load lessons list: {lessonsListError}
+                  </small>
+                </div>
+              )}
+
+              {!isLoadingLessonsList && !lessonsListError && lessonsList.length === 0 && (
+                <div className="setting-item">
+                  <small style={{ color: '#aaa', fontSize: '0.9rem' }}>
+                    No lessons available.
+                  </small>
+                </div>
+              )}
+
+              {!isLoadingLessonsList && lessonsList.map((lesson) => (
+                <button
+                  key={lesson.file}
+                  type="button"
+                  onClick={() => handlePickLesson(lesson.file)}
+                  disabled={isLoading}
+                  style={{
+                    display: 'block',
+                    width: '100%',
+                    textAlign: 'left',
+                    padding: '0.7rem 0.9rem',
+                    marginBottom: '0.5rem',
+                    background: '#3c3c3c',
+                    border: '1px solid #555',
+                    borderRadius: '8px',
+                    color: '#fff',
+                    fontSize: '0.95rem',
+                    cursor: isLoading ? 'not-allowed' : 'pointer',
+                    opacity: isLoading ? 0.6 : 1,
+                    transition: 'background 0.2s ease, border-color 0.2s ease, transform 0.15s ease',
+                  }}
+                  onMouseEnter={(e) => {
+                    if (!isLoading) {
+                      e.currentTarget.style.background = '#4a4a4a';
+                      e.currentTarget.style.borderColor = '#0078d4';
+                      e.currentTarget.style.transform = 'translateY(-1px)';
+                    }
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = '#3c3c3c';
+                    e.currentTarget.style.borderColor = '#555';
+                    e.currentTarget.style.transform = 'translateY(0)';
+                  }}
+                >
+                  <div style={{ fontWeight: 600 }}>
+                    {lesson.title || lesson.file}
+                  </div>
+                  {lesson.title && lesson.file !== lesson.title && (
+                    <div style={{ fontSize: '0.75rem', color: '#aaa', marginTop: 2 }}>
+                      {lesson.file}
+                    </div>
+                  )}
+                </button>
+              ))}
+            </div>
+
+            <div className="settings-footer">
+              <button
+                className="settings-cancel"
+                onClick={() => { if (!isLoading) setIsLessonPickerOpen(false); }}
+                disabled={isLoading}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isStatsOpen && (
+        <div
+          className="settings-overlay"
+          onClick={closeStats}
+          role="presentation"
+        >
+          <div
+            className="settings-modal stats-modal"
+            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="stats-title"
+          >
+            <div className="settings-header">
+              <h2 id="stats-title">📊 Mismatched Words Statistics</h2>
+              <button
+                className="settings-close"
+                onClick={closeStats}
+                aria-label="Close statistics"
+                title="Close"
+              >
+                <span aria-hidden="true">×</span>
+              </button>
+            </div>
+
+            <div className="settings-content">
+              {isLoadingStats && (
+                <div className="setting-item">
+                  <small style={{ color: '#aaa', fontSize: '0.9rem' }}>Loading…</small>
+                </div>
+              )}
+
+              {!isLoadingStats && statsError && (
+                <div className="setting-item">
+                  <small style={{ color: '#f44336', fontSize: '0.85rem' }}>
+                    ⚠️ {statsError}
+                  </small>
+                </div>
+              )}
+
+              {!isLoadingStats && !statsError && statsData && Object.keys(statsData).length === 0 && (
+                <div className="setting-item">
+                  <small style={{ color: '#aaa', fontSize: '0.9rem' }}>
+                    No statistics recorded yet.
+                  </small>
+                </div>
+              )}
+
+              {!isLoadingStats && !statsError && statsData && Object.keys(statsData).length > 0 && (
+                <table className="stats-table">
+                  <thead>
+                    <tr>
+                      <th>Word</th>
+                      <th>Attempts</th>
+                      <th>Matched</th>
+                      <th>Mismatched</th>
+                      <th>Recognized as</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Object.entries(statsData)
+                      .sort((a, b) => b[1].attempts - a[1].attempts)
+                      .map(([word, entry]) => {
+                        const buckets = Object.entries(entry.unmatched || {})
+                          .sort((a, b) => b[1] - a[1]);
+                        return (
+                          <tr key={word}>
+                            <td className="stats-word">{word}</td>
+                            <td>{entry.attempts}</td>
+                            <td className="stats-matched">{entry.matched}</td>
+                            <td className="stats-mismatched">{entry.mismatched}</td>
+                            <td>
+                              {buckets.length === 0 ? (
+                                <span style={{ color: '#888' }}>—</span>
+                              ) : (
+                                <ul className="stats-buckets">
+                                  {buckets.map(([heard, count]) => (
+                                    <li key={heard || '__empty__'}>
+                                      <span className="stats-bucket-heard">
+                                        {heard === '' ? '(silence)' : heard}
+                                      </span>
+                                      <span className="stats-bucket-count">×{count}</span>
+                                    </li>
+                                  ))}
+                                </ul>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                  </tbody>
+                </table>
+              )}
+            </div>
+
+            <div className="settings-footer">
+              <button
+                className="settings-cancel"
+                onClick={closeStats}
+              >
+                Close
+              </button>
+              <button
+                className="settings-save"
+                onClick={async () => {
+                  try {
+                    await fetch('/api/raf-stats', { method: 'DELETE' });
+                    setStatsData({});
+                  } catch (err) {
+                    setStatsError(err.message || 'Failed to clear statistics');
+                  }
+                }}
+              >
+                🗑️ Clear
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isCreditOpen && (
+        <div
+          className="settings-overlay"
+          onClick={() => setIsCreditOpen(false)}
+          role="presentation"
+        >
+          <div
+            className="settings-modal credit-modal"
+            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="credit-title"
+          >
+            <div className="settings-header">
+              <h2 id="credit-title">🌱 Eco Cards</h2>
+              <button
+                className="settings-close"
+                onClick={() => setIsCreditOpen(false)}
+                aria-label="Close"
+                title="Close"
+              >
+                <span aria-hidden="true">×</span>
+              </button>
+            </div>
+
+            <div className="settings-content">
+              <button
+                type="button"
+                className="credit-share-hint"
+                onClick={shareEcoCards}
+                title="Share Eco Cards link"
+              >
+                Click to share Eco Cards link.
+              </button>
+
+              <p className="credit-browser-hint">
+                Use browser Chrome or Opera to open.
+              </p>
+
+              <div className="credit-qr-block">
+                <button
+                  type="button"
+                  className="credit-qr-link"
+                  onClick={shareEcoCards}
+                  aria-label="Share Eco Cards link"
+                  title="Share Eco Cards link"
+                >
+                  <img
+                    className="credit-qr"
+                    src="/qr.svg"
+                    alt="QR code for Eco Cards — click to share the link"
+                    width={180}
+                    height={180}
+                  />
+                </button>
+              </div>
+
+              <p className="credit-text">
+                Suggestions for improvement:{' '}
+                <a
+                  href="mailto:bogatyrev.viktor@gmail.com?subject=Eco%20Cards%20suggestion"
+                  className="credit-email"
+                >
+                  bogatyrev.viktor@gmail.com
+                </a>
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <input
+        type="file"
+        ref={settingsFileInputRef}
+        accept=".settings,.json"
+        style={{ display: 'none' }}
+        aria-hidden="true"
+        tabIndex={-1}
+        onChange={(e) => {
+          if (e.target.files && e.target.files[0]) {
+            loadSettingsFromFile(e.target.files[0]);
+            e.target.value = '';
+          }
+        }}
+      />
+    </div>
+  );
+};
+
+export default App;

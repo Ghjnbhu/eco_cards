@@ -1,0 +1,221 @@
+{
+  "type": "directory",
+  "name": "1.EcoCards",
+  "path": ".",
+  "contents": [
+    {
+      "type": "directory",
+      "name": "app",
+      "path": "app",
+      "contents": [
+        {
+          "type": "directory",
+          "name": "api",
+          "path": "app/api",
+          "contents": [
+            {
+              "type": "directory",
+              "name": "raf-stats",
+              "path": "app/api/raf-stats",
+              "contents": []
+            }
+          ]
+        },
+        {
+          "type": "directory",
+          "name": "lesson",
+          "path": "app/lesson",
+          "contents": [
+            {
+              "type": "directory",
+              "name": "Alphabet",
+              "path": "app/lesson/Alphabet",
+              "contents": []
+            },
+            {
+              "type": "directory",
+              "name": "Alphabet_Vowels",
+              "path": "app/lesson/Alphabet_Vowels",
+              "contents": []
+            },
+            {
+              "type": "directory",
+              "name": "KitchenCards_20",
+              "path": "app/lesson/KitchenCards_20",
+              "contents": []
+            },
+            {
+              "type": "directory",
+              "name": "MyEnglishFlashcards",
+              "path": "app/lesson/MyEnglishFlashcards",
+              "contents": []
+            },
+            {
+              "type": "directory",
+              "name": "MyEnglishLessons",
+              "path": "app/lesson/MyEnglishLessons",
+              "contents": []
+            },
+            {
+              "type": "directory",
+              "name": "Table_ei",
+              "path": "app/lesson/Table_ei",
+              "contents": []
+            },
+            {
+              "type": "directory",
+              "name": "Table_æ",
+              "path": "app/lesson/Table_æ",
+              "contents": []
+            }
+          ]
+        },
+        {
+          "type": "file",
+          "name": "favicon.ico",
+          "path": "app/favicon.ico"
+        },
+        {
+          "type": "file",
+          "name": "globals.css",
+          "path": "app/globals.css"
+        },
+        {
+          "type": "file",
+          "name": "layout.tsx",
+          "path": "app/layout.tsx"
+        },
+        {
+          "type": "file",
+          "name": "page.tsx",
+          "path": "app/page.tsx"
+        }
+      ]
+    },
+    {
+      "type": "directory",
+      "name": "components",
+      "path": "components",
+      "contents": [
+        {
+          "type": "file",
+          "name": "EcoCardsApp.jsx",
+          "path": "components/EcoCardsApp.jsx"
+        }
+      ]
+    },
+    {
+      "type": "directory",
+      "name": "lib",
+      "path": "lib",
+      "contents": [
+        {
+          "type": "file",
+          "name": "raf-stats.js",
+          "path": "lib/raf-stats.js"
+        }
+      ]
+    },
+    {
+      "type": "directory",
+      "name": "public",
+      "path": "public",
+      "contents": [
+        {
+          "type": "directory",
+          "name": "lessons",
+          "path": "public/lessons",
+          "contents": []
+        },
+        {
+          "type": "file",
+          "name": "file.svg",
+          "path": "public/file.svg"
+        },
+        {
+          "type": "file",
+          "name": "globe.svg",
+          "path": "public/globe.svg"
+        },
+        {
+          "type": "file",
+          "name": "next.svg",
+          "path": "public/next.svg"
+        },
+        {
+          "type": "file",
+          "name": "vercel.svg",
+          "path": "public/vercel.svg"
+        },
+        {
+          "type": "file",
+          "name": "window.svg",
+          "path": "public/window.svg"
+        }
+      ]
+    },
+    {
+      "type": "directory",
+      "name": "src",
+      "path": "src",
+      "contents": [
+        {
+          "type": "directory",
+          "name": "assets",
+          "path": "src/assets",
+          "contents": []
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "name": ".gitignore",
+      "path": ".gitignore"
+    },
+    {
+      "type": "file",
+      "name": "AGENTS.md",
+      "path": "AGENTS.md"
+    },
+    {
+      "type": "file",
+      "name": "eslint.config.mjs",
+      "path": "eslint.config.mjs"
+    },
+    {
+      "type": "file",
+      "name": "next-env.d.ts",
+      "path": "next-env.d.ts"
+    },
+    {
+      "type": "file",
+      "name": "next.config.ts",
+      "path": "next.config.ts"
+    },
+    {
+      "type": "file",
+      "name": "package-lock.json",
+      "path": "package-lock.json"
+    },
+    {
+      "type": "file",
+      "name": "package.json",
+      "path": "package.json"
+    },
+    {
+      "type": "file",
+      "name": "README.md",
+      "path": "README.md"
+    },
+    {
+      "type": "file",
+      "name": "tree_to_json.py",
+      "path": "tree_to_json.py"
+    },
+    {
+      "type": "file",
+      "name": "tsconfig.json",
+      "path": "tsconfig.json"
+    }
+  ]
+}
