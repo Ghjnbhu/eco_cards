@@ -1,8 +1,25 @@
 {
   "type": "directory",
-  "name": "1.EcoCards",
+  "name": "eco_cards",
   "path": ".",
   "contents": [
+    {
+      "type": "directory",
+      "name": ".vercel",
+      "path": ".vercel",
+      "contents": [
+        {
+          "type": "file",
+          "name": "project.json",
+          "path": ".vercel/project.json"
+        },
+        {
+          "type": "file",
+          "name": "README.txt",
+          "path": ".vercel/README.txt"
+        }
+      ]
+    },
     {
       "type": "directory",
       "name": "app",
@@ -17,7 +34,13 @@
               "type": "directory",
               "name": "raf-stats",
               "path": "app/api/raf-stats",
-              "contents": []
+              "contents": [
+                {
+                  "type": "file",
+                  "name": "route.ts",
+                  "path": "app/api/raf-stats/route.ts"
+                }
+              ]
             }
           ]
         },
@@ -36,6 +59,12 @@
               "type": "directory",
               "name": "Alphabet_Vowels",
               "path": "app/lesson/Alphabet_Vowels",
+              "contents": []
+            },
+            {
+              "type": "directory",
+              "name": "Digits_0-10",
+              "path": "app/lesson/Digits_0-10",
               "contents": []
             },
             {
@@ -125,7 +154,58 @@
           "type": "directory",
           "name": "lessons",
           "path": "public/lessons",
-          "contents": []
+          "contents": [
+            {
+              "type": "file",
+              "name": "Alphabet.json",
+              "path": "public/lessons/Alphabet.json"
+            },
+            {
+              "type": "file",
+              "name": "Alphabet_Vowels.json",
+              "path": "public/lessons/Alphabet_Vowels.json"
+            },
+            {
+              "type": "file",
+              "name": "Digits_0-10.json",
+              "path": "public/lessons/Digits_0-10.json"
+            },
+            {
+              "type": "file",
+              "name": "index.json",
+              "path": "public/lessons/index.json"
+            },
+            {
+              "type": "file",
+              "name": "KitchenCards_20.json",
+              "path": "public/lessons/KitchenCards_20.json"
+            },
+            {
+              "type": "file",
+              "name": "MyEnglishFlashcards.json",
+              "path": "public/lessons/MyEnglishFlashcards.json"
+            },
+            {
+              "type": "file",
+              "name": "MyEnglishLessons.json",
+              "path": "public/lessons/MyEnglishLessons.json"
+            },
+            {
+              "type": "file",
+              "name": "Table_ei.json",
+              "path": "public/lessons/Table_ei.json"
+            },
+            {
+              "type": "file",
+              "name": "Table_æ.json",
+              "path": "public/lessons/Table_æ.json"
+            }
+          ]
+        },
+        {
+          "type": "file",
+          "name": "favicon.svg",
+          "path": "public/favicon.svg"
         },
         {
           "type": "file",
@@ -139,8 +219,28 @@
         },
         {
           "type": "file",
+          "name": "google6c68486600bc7f04.html",
+          "path": "public/google6c68486600bc7f04.html"
+        },
+        {
+          "type": "file",
+          "name": "icon.svg",
+          "path": "public/icon.svg"
+        },
+        {
+          "type": "file",
           "name": "next.svg",
           "path": "public/next.svg"
+        },
+        {
+          "type": "file",
+          "name": "qr.svg",
+          "path": "public/qr.svg"
+        },
+        {
+          "type": "file",
+          "name": "robots.txt",
+          "path": "public/robots.txt"
         },
         {
           "type": "file",
@@ -163,9 +263,30 @@
           "type": "directory",
           "name": "assets",
           "path": "src/assets",
-          "contents": []
+          "contents": [
+            {
+              "type": "file",
+              "name": "qr.svg",
+              "path": "src/assets/qr.svg"
+            }
+          ]
+        },
+        {
+          "type": "file",
+          "name": "App.css",
+          "path": "src/App.css"
+        },
+        {
+          "type": "file",
+          "name": "App.css.BACK_UP",
+          "path": "src/App.css.BACK_UP"
         }
       ]
+    },
+    {
+      "type": "file",
+      "name": ".env.local",
+      "path": ".env.local"
     },
     {
       "type": "file",
