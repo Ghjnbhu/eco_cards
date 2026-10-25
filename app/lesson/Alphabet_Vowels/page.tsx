@@ -16,11 +16,6 @@ export const metadata: Metadata = {
   },
 };
 
-export default function AlphabetVowelsPage() {
-  return (
-    <EcoCardsApp
-      lessonFile="/lessons/Alphabet_Vowels.json"
-      lessonTitle="English Vowels"
-    />
-  );
+export default function AlphabetPage() {
+  return <EcoCardsApp />;
 }

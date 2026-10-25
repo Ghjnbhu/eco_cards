@@ -16,11 +16,6 @@ export const metadata: Metadata = {
   },
 };
 
-export default function TableAePage() {
-  return (
-    <EcoCardsApp
-      lessonFile="/lessons/Table_æ.json"
-      lessonTitle="Æ Vowel Table"
-    />
-  );
+export default function AlphabetPage() {
+  return <EcoCardsApp />;
 }

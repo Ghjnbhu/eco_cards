@@ -17,10 +17,5 @@ export const metadata: Metadata = {
 };
 
 export default function AlphabetPage() {
-  return (
-    <EcoCardsApp
-      lessonFile="/lessons/Alphabet.json"
-      lessonTitle="English Alphabet"
-    />
-  );
+  return <EcoCardsApp />;
 }

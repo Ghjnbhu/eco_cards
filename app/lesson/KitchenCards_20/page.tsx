@@ -16,11 +16,6 @@ export const metadata: Metadata = {
   },
 };
 
-export default function KitchenCardsPage() {
-  return (
-    <EcoCardsApp
-      lessonFile="/lessons/KitchenCards_20.json"
-      lessonTitle="Kitchen Vocabulary"
-    />
-  );
+export default function AlphabetPage() {
+  return <EcoCardsApp />;
 }

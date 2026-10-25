@@ -16,11 +16,6 @@ export const metadata: Metadata = {
   },
 };
 
-export default function DigitsPage() {
-  return (
-    <EcoCardsApp
-      lessonFile="/lessons/Digits_0-10.json"
-      lessonTitle="Numbers 0–10"
-    />
-  );
+export default function AlphabetPage() {
+  return <EcoCardsApp />;
 }

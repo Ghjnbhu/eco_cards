@@ -16,11 +16,6 @@ export const metadata: Metadata = {
   },
 };
 
-export default function MyEnglishFlashcardsPage() {
-  return (
-    <EcoCardsApp
-      lessonFile="/lessons/MyEnglishFlashcards.json"
-      lessonTitle="My English Flashcards"
-    />
-  );
+export default function AlphabetPage() {
+  return <EcoCardsApp />;
 }

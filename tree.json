@@ -53,49 +53,97 @@
               "type": "directory",
               "name": "Alphabet",
               "path": "app/lesson/Alphabet",
-              "contents": []
+              "contents": [
+                {
+                  "type": "file",
+                  "name": "page.tsx",
+                  "path": "app/lesson/Alphabet/page.tsx"
+                }
+              ]
             },
             {
               "type": "directory",
               "name": "Alphabet_Vowels",
               "path": "app/lesson/Alphabet_Vowels",
-              "contents": []
+              "contents": [
+                {
+                  "type": "file",
+                  "name": "page.tsx",
+                  "path": "app/lesson/Alphabet_Vowels/page.tsx"
+                }
+              ]
             },
             {
               "type": "directory",
               "name": "Digits_0-10",
               "path": "app/lesson/Digits_0-10",
-              "contents": []
+              "contents": [
+                {
+                  "type": "file",
+                  "name": "page.tsx",
+                  "path": "app/lesson/Digits_0-10/page.tsx"
+                }
+              ]
             },
             {
               "type": "directory",
               "name": "KitchenCards_20",
               "path": "app/lesson/KitchenCards_20",
-              "contents": []
+              "contents": [
+                {
+                  "type": "file",
+                  "name": "page.tsx",
+                  "path": "app/lesson/KitchenCards_20/page.tsx"
+                }
+              ]
             },
             {
               "type": "directory",
               "name": "MyEnglishFlashcards",
               "path": "app/lesson/MyEnglishFlashcards",
-              "contents": []
+              "contents": [
+                {
+                  "type": "file",
+                  "name": "page.tsx",
+                  "path": "app/lesson/MyEnglishFlashcards/page.tsx"
+                }
+              ]
             },
             {
               "type": "directory",
               "name": "MyEnglishLessons",
               "path": "app/lesson/MyEnglishLessons",
-              "contents": []
+              "contents": [
+                {
+                  "type": "file",
+                  "name": "page.tsx",
+                  "path": "app/lesson/MyEnglishLessons/page.tsx"
+                }
+              ]
             },
             {
               "type": "directory",
               "name": "Table_ei",
               "path": "app/lesson/Table_ei",
-              "contents": []
+              "contents": [
+                {
+                  "type": "file",
+                  "name": "page.tsx",
+                  "path": "app/lesson/Table_ei/page.tsx"
+                }
+              ]
             },
             {
               "type": "directory",
               "name": "Table_æ",
               "path": "app/lesson/Table_æ",
-              "contents": []
+              "contents": [
+                {
+                  "type": "file",
+                  "name": "page.tsx",
+                  "path": "app/lesson/Table_æ/page.tsx"
+                }
+              ]
             }
           ]
         },
@@ -118,6 +166,21 @@
           "type": "file",
           "name": "layout.tsx",
           "path": "app/layout.tsx"
+        },
+        {
+          "type": "file",
+          "name": "og-image.png",
+          "path": "app/og-image.png"
+        },
+        {
+          "type": "file",
+          "name": "og-image.psd",
+          "path": "app/og-image.psd"
+        },
+        {
+          "type": "file",
+          "name": "og-image_2.psd",
+          "path": "app/og-image_2.psd"
         },
         {
           "type": "file",
