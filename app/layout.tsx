@@ -57,7 +57,7 @@ export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
   viewportFit: "cover",
-  themeColor: "#ffffff", // добавьте реальный цвет темы
+  themeColor: "#d5cdcd", // добавьте реальный цвет темы
 };
 
 export default function RootLayout({
