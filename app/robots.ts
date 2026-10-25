@@ -1,14 +1,18 @@
-import type { MetadataRoute } from 'next';
+// app/robots.ts
+import type { MetadataRoute } from "next";
+
+const BASE_URL = process.env.NEXT_PUBLIC_SITE_URL ?? "https://ecocards-brown.vercel.app";
 
 export default function robots(): MetadataRoute.Robots {
-  const baseUrl = 'https://your-domain.com'; // Replace with your domain
-
   return {
     rules: {
-      userAgent: '*',
-      allow: '/',
-      disallow: ['/api/', '/_next/'], // Block API routes and Next.js internal paths
+      userAgent: "*",
+      allow: "/",
+      disallow: [
+        "/api/",
+        // Do NOT disallow /_next/ — Googlebot needs it to render your pages.
+      ],
     },
-    sitemap: `${baseUrl}/sitemap.xml`,
+    sitemap: `${BASE_URL}/sitemap.xml`,
   };
 }

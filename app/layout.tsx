@@ -3,7 +3,7 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://ecocards-brown.vercel.app/"), // ← замените на ваш домен
+  metadataBase: new URL("https://ecocards-brown.vercel.app"), // ← замените на ваш домен
   title: {
     default: "Eco Cards — English Vocabulary Study App",
     template: "%s | Eco Cards",
@@ -14,7 +14,7 @@ export const metadata: Metadata = {
   openGraph: {
     type: "website",
     locale: "en_US",
-    url: "https://ecocards-brown.vercel.app/",
+    url: "https://ecocards-brown.vercel.app",
     siteName: "Eco Cards",
     title: "Eco Cards — English Vocabulary Study App",
     description:
@@ -49,7 +49,7 @@ export const metadata: Metadata = {
     },
   },
   verification: {
-    google: "GcL92mLSs_lIP4H7rl6oh7lmfdEmcu_MamTJCS6CCNA", // ✅ вместо other
+    google: "NEW_TOKEN_FOR_ECOCARDS_BROWN",
   },
 };
 

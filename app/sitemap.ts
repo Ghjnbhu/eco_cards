@@ -1,13 +1,35 @@
-import type { MetadataRoute } from 'next';
+// app/sitemap.ts
+import type { MetadataRoute } from "next";
+
+const BASE_URL = process.env.NEXT_PUBLIC_SITE_URL ?? "https://ecocards-brown.vercel.app";
+
+const lessons: { slug: string; lastModified?: Date }[] = [
+  { slug: "Alphabet" },
+  { slug: "Alphabet_Vowels" },
+  { slug: "Digits_0-10" },
+  { slug: "KitchenCards_20" },
+  { slug: "MyEnglishFlashcards" },
+  { slug: "MyEnglishLessons" },
+  { slug: "Table_ei" },
+  { slug: "Table_æ" }, // ← will be encoded below
+];
 
 export default function sitemap(): MetadataRoute.Sitemap {
-  const baseUrl = 'https://your-domain.com'; // Replace with your domain
+  const buildDate = new Date();
 
-  // List your important pages here. 
-  // You likely need to add the lesson routes from your tree.json
   return [
-    { url: baseUrl, lastModified: new Date(), changeFrequency: 'weekly', priority: 1 },
-    { url: `${baseUrl}/lesson/Alphabet`, lastModified: new Date(), changeFrequency: 'monthly', priority: 0.8 },
-    // ... add other lesson paths
+    {
+      url: BASE_URL,
+      lastModified: buildDate,
+      changeFrequency: "weekly",
+      priority: 1,
+    },
+    ...lessons.map(({ slug, lastModified }) => ({
+      // encodeURIComponent → "Table_æ" becomes "Table_%C3%A6"
+      url: `${BASE_URL}/lesson/${encodeURIComponent(slug)}`,
+      lastModified: lastModified ?? buildDate,
+      changeFrequency: "monthly" as const,
+      priority: 0.8,
+    })),
   ];
 }
